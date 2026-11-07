@@ -20,7 +20,7 @@
   - Реализовать `internal/db`: подключение `pgxpool`, метод `Ping(ctx)` и интеграционный тест `db_test.go`.
   - Сделать git commit.
 
-- [ ] **Step 3: Выборка задач и `LISTEN/NOTIFY` в `internal/db`**
+- [x] **Step 3: Выборка задач и `LISTEN/NOTIFY` в `internal/db`**
   - Написать метод `CreateInput(ctx, source, payload)` для вставки события в `sm_inputs`.
   - Написать метод `PickNextJob(ctx)` с `FOR UPDATE SKIP LOCKED`, переводящий задачу из `pending` в `dispatched` (с использованием PG 18 `RETURNING`).
   - Написать метод `UpdateJobStatus(ctx, jobID, status, resultPath, errorMsg)` для обновления статуса и записи артефакта в `sm_outputs` при `completed`.
