@@ -44,7 +44,7 @@
   - Покрыть тестами через `httptest` в `internal/api/server_test.go`.
   - Сделать git commit.
 
-- [ ] **Step 6: Точка входа `cmd/petar/main.go` и Graceful Shutdown**
+- [x] **Step 6: Точка входа `cmd/petar/main.go` и Graceful Shutdown**
   - Собрать все компоненты в `cmd/petar/main.go`.
   - Настроить перехват `SIGINT` / `SIGTERM` (`signal.NotifyContext`), корректную остановку HTTP-сервера и Spool-воркера.
   - Проверить сборку `go build ./cmd/petar`.
