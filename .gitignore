@@ -1,0 +1,42 @@
+# Данные PostgreSQL (хранятся локально, в репозиторий не идут)
+postgres/data/
+
+# Файловые буферы очереди задач (/spool)
+spool/in/*
+spool/out/*
+!spool/in/.gitkeep
+!spool/out/.gitkeep
+
+# Бинарные файлы и сборки Go
+bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+petar
+
+# Временные файлы тестов и профилирования
+*.prof
+cpu.out
+mem.out
+coverage.html
+
+# Локальные конфиги и переменные окружения
+*.env
+*.env.*
+!.env.example
+
+# Кэш и логи OpenCode / редакторов
+.opencode/cache/
+.opencode/sessions/
+*.log
+
+# Системные и IDE файлы
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
