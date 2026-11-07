@@ -7,7 +7,7 @@
   - Данные в `/opt/go-pet/postgres/data`, конфиг в `/opt/go-pet/postgres/postgresql.conf`.
   - Миграция `000001_init_extensions` (`vector`, `file_fdw`, `pg_trgm`) применена.
 
-- [ ] **Step 1: Миграция State Machine (`000002_create_state_machine`)**
+- [x] **Step 1: Миграция State Machine (`000002_create_state_machine`)**
   - Создать `/opt/go-pet/postgres/migrations/000002_create_state_machine.up.sql` и `.down.sql`.
   - Таблицы: `sm_inputs`, `sm_processes`, `sm_jobs`, `sm_job_logs`, `sm_outputs` с `uuidv7()`.
   - Триггеры: авто-создание процесса и первой задачи из `sm_inputs`, аудит статусов в `sm_job_logs`, `pg_notify('sm_jobs_channel', ...)` при `status = 'pending'`.
