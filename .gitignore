@@ -40,3 +40,5 @@ coverage.html
 .idea/
 .DS_Store
 Thumbs.db
+spool/processing/*
+!spool/processing/.gitkeep
