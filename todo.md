@@ -35,7 +35,7 @@
   - Написать unit/integration тесты `internal/spool/spool_test.go`.
   - Сделать git commit.
 
-- [ ] **Step 5: HTTP Callback API и Health Probes (`internal/api`)**
+- [x] **Step 5: HTTP Callback API и Health Probes (`internal/api`)**
   - Реализовать HTTP-сервер на стандартном `net/http` (Go 1.23):
     - `GET /healthz` (200 OK)
     - `GET /readyz` (проверка `db.Ping`)
