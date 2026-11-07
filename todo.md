@@ -14,7 +14,7 @@
   - Применить миграцию в `petar_db` и проверить SQL-скриптом создание цепочки `sm_inputs -> sm_processes -> sm_jobs`.
   - Сделать git commit.
 
-- [ ] **Step 2: Конфигурация и пул соединений БД (`internal/config`, `internal/db`)**
+- [x] **Step 2: Конфигурация и пул соединений БД (`internal/config`, `internal/db`)**
   - Инициализировать зависимости (`pgx/v5`).
   - Реализовать `internal/config` (чтение `DB_DSN`, `SPOOL_DIR`, `HTTP_ADDR`, `POLL_INTERVAL` из ENV с дефолтами для локальной разработки).
   - Реализовать `internal/db`: подключение `pgxpool`, метод `Ping(ctx)` и интеграционный тест `db_test.go`.
