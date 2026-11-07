@@ -21,22 +21,36 @@ func New(ctx context.Context, dsn string) (*DB, error) {
 		return nil, fmt.Errorf("create database pool: %w", err)
 	}
 
-	listener, err := pool.Acquire(ctx)
-	if err != nil {
+	database := &DB{pool: pool}
+	if err := database.ReconnectListener(ctx); err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("acquire listener connection: %w", err)
+		return nil, err
+	}
+
+	return database, nil
+}
+
+func (d *DB) ReconnectListener(ctx context.Context) error {
+	d.listenerMu.Lock()
+	defer d.listenerMu.Unlock()
+
+	if d.listener != nil {
+		d.listener.Release()
+		d.listener = nil
+	}
+
+	listener, err := d.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire listener connection: %w", err)
 	}
 
 	if _, err := listener.Exec(ctx, listenJobsQuery); err != nil {
 		listener.Release()
-		pool.Close()
-		return nil, fmt.Errorf("listen sm_jobs_channel: %w", err)
+		return fmt.Errorf("listen sm_jobs_channel: %w", err)
 	}
 
-	return &DB{
-		pool:     pool,
-		listener: listener,
-	}, nil
+	d.listener = listener
+	return nil
 }
 
 func (d *DB) Ping(ctx context.Context) error {

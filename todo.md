@@ -28,7 +28,7 @@
   - Покрыть интеграционными тестами в `internal/db/queue_test.go` (включая проверку конкурентного `SKIP LOCKED`).
   - Сделать git commit.
 
-- [ ] **Step 4: Файловый мост Spool (`internal/spool`)**
+- [x] **Step 4: Файловый мост Spool (`internal/spool`)**
   - Создать каталог `/opt/go-pet/spool/processing` (с `.gitkeep`).
   - Реализовать пакет `internal/spool`: атомарная запись задачи в `/spool/in/{job_id}.tmp` с `Sync()` и переименованием в `/spool/in/{job_id}.json`.
   - Реализовать фоновый цикл `Worker.Run(ctx)`: гибрид `LISTEN sm_jobs_channel` + fallback ticker (45s) -> `PickNextJob` -> `Spool.WriteJob`.
