@@ -50,7 +50,7 @@
   - Проверить сборку `go build ./cmd/petar`.
   - Сделать git commit.
 
-- [ ] **Step 7: Хостовый скрипт `scripts/spool-runner.sh`**
+- [x] **Step 7: Хостовый скрипт `scripts/spool-runner.sh`**
   - Написать скрипт `/opt/go-pet/scripts/spool-runner.sh` (с `jq` и `curl`).
   - Логика: мониторинг `/spool/in/*.json` -> перенос в `/spool/processing/` -> `POST in_progress` -> выполнение инструмента (`echo-test`, `yt-dlp`, `fabric`) с сохранением вывода в `/spool/out/{job_id}/` -> `POST completed/failed` -> удаление файла из `processing/`.
   - Провести сквозной (E2E) тест: вставка записи в `sm_inputs` -> файл в `/spool/in` -> обработка `spool-runner.sh` -> статус `completed` в `sm_jobs` и запись в `sm_outputs`.
