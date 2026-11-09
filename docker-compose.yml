@@ -19,6 +19,31 @@ services:
       - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
       - ./spool:/spool
     command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U petar_user -d petar_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - petar_net
+
+  app:
+    build:
+      context: .
+      network: host
+    container_name: petar_app
+    restart: unless-stopped
+    environment:
+      DB_DSN: "postgres://petar_user:petar_password@postgres:5432/petar_db?sslmode=disable"
+      SPOOL_DIR: "/app/spool"
+      HTTP_ADDR: "0.0.0.0:8080"
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./spool:/app/spool
+    depends_on:
+      postgres:
+        condition: service_healthy
     networks:
       - petar_net
 
