@@ -87,7 +87,7 @@ func newServer(database databaseAPI, logger *slog.Logger) *Server {
 		"POST /api/v1/jobs/{id}/status",
 		server.handleUpdateJobStatus,
 	)
-	server.handler = mux
+	server.handler = loggingMiddleware(logger)(mux)
 
 	return server
 }
