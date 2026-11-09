@@ -25,7 +25,7 @@ type databaseAPI interface {
 		ctx context.Context,
 		source string,
 		payload json.RawMessage,
-	) (uuid.UUID, error)
+	) (db.CreatedInput, error)
 
 	UpdateJobStatus(
 		ctx context.Context,
@@ -48,7 +48,10 @@ type createInputRequest struct {
 }
 
 type createInputResponse struct {
-	ID uuid.UUID `json:"id"`
+	InputID   uuid.UUID `json:"input_id"`
+	ProcessID uuid.UUID `json:"process_id"`
+	Status    string    `json:"status"`
+	ID        uuid.UUID `json:"id"`
 }
 
 type updateJobStatusRequest struct {
@@ -132,7 +135,7 @@ func (s *Server) handleCreateInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	inputID, err := s.database.CreateInput(r.Context(), source, request.Payload)
+	created, err := s.database.CreateInput(r.Context(), source, request.Payload)
 	if err != nil {
 		s.logger.Error(
 			"create input through HTTP API failed",
@@ -144,7 +147,12 @@ func (s *Server) handleCreateInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.writeJSON(w, http.StatusCreated, createInputResponse{ID: inputID})
+	s.writeJSON(w, http.StatusCreated, createInputResponse{
+		InputID:   created.InputID,
+		ProcessID: created.ProcessID,
+		Status:    created.Status,
+		ID:        created.InputID,
+	})
 }
 
 func (s *Server) handleUpdateJobStatus(w http.ResponseWriter, r *http.Request) {

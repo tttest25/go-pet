@@ -68,3 +68,10 @@
   - Добавить сервис `app` (`petar_app`) и `healthcheck` для `postgres` в `/opt/go-pet/docker-compose.yml` с сохранением всех путей `/opt/go-pet/postgres/`.
   - Запустить весь стек через `docker compose up -d --build` и проверить прохождение E2E-теста.
   - Сделать финальный git commit этапа MVP.
+- [x] **Step 10: Расширение ответа `POST /api/v1/inputs` до контракта интеграции с DokuWiki**
+  - Контекст: BFF-плагин `petar` для DokuWiki (репозиторий `php-wiki-plugin`) валидирует ответ по контракту: `201 {"input_id":"<uuid>","process_id":"<uuid>","status":"new"}` (см. его `docs/architecture.md` §4.5). Фактический ответ `201 {"id":"<uuid>"}` отклоняется прокси с `502 Incomplete backend response structure` — интеграция не работает.
+  - `internal/db/queue.go`: расширить `createInputQuery` до `RETURNING id, status`; добавить запрос выборки процесса, авто-созданного триггером: `SELECT id FROM sm_processes WHERE input_id = $1 ORDER BY created_at ASC LIMIT 1`; изменить сигнатуру `CreateInput` — возвращать структуру (например `*CreatedInput{InputID, ProcessID, Status uuid.UUID/uuid.UUID/Status`); процесс виден в той же сессии сразу после INSERT (AFTER INSERT trigger).
+  - `internal/api/server.go`: обновить интерфейс `databaseAPI` и `createInputResponse` — отдавать `input_id`, `process_id`, `status`; легаси-поле `id` (равное `input_id`) сохранить для совместимости. `status` брать из статуса записи `sm_inputs` (после вставки — `'new'`).
+  - Адаптировать тесты и фейки `databaseAPI` (`internal/api/server_test.go`, `internal/db/queue_test.go`): новые ожидания пишутся первыми и должны падать (red), затем реализация (green); проверить валидность UUID `input_id`/`process_id` и `status == "new"`.
+  - Проверка: `go test -v -race ./...`, `go build ./cmd/petar`, пересборка и рестарт контейнера `petar_app`, probe-команда возвращает три обязательных поля, отправка формы из DokuWiki (пользователь @ai/@admin) показывает Input ID / Process ID и пишет `data-input-id`/`data-process-id` в DOM.
+  - Сделать git commit: `fix: return input_id/process_id/status from POST /api/v1/inputs`

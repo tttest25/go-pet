@@ -3,12 +3,14 @@ package db_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"petar/internal/config"
@@ -97,25 +99,24 @@ func (e *queueTestEnv) createJob(
 ) testJobIDs {
 	t.Helper()
 
-	inputID, err := e.database.CreateInput(ctx, e.source, payload)
+	created, err := e.database.CreateInput(ctx, e.source, payload)
 	if err != nil {
 		t.Fatalf("create input: %v", err)
 	}
-	if inputID == uuid.Nil {
-		t.Fatal("CreateInput returned a nil UUID")
+	if created.InputID == uuid.Nil || created.ProcessID == uuid.Nil {
+		t.Fatalf("CreateInput returned a nil UUID: %+v", created)
 	}
 
-	var ids testJobIDs
-	ids.inputID = inputID
+	ids := testJobIDs{
+		inputID:   created.InputID,
+		processID: created.ProcessID,
+	}
 	if err := e.pool.QueryRow(
 		ctx,
-		`SELECT p.id, j.id
-		 FROM sm_processes p
-		 JOIN sm_jobs j ON j.process_id = p.id
-		 WHERE p.input_id = $1`,
-		inputID,
-	).Scan(&ids.processID, &ids.jobID); err != nil {
-		t.Fatalf("query generated process and job: %v", err)
+		"SELECT id FROM sm_jobs WHERE process_id = $1",
+		created.ProcessID,
+	).Scan(&ids.jobID); err != nil {
+		t.Fatalf("query generated job: %v", err)
 	}
 
 	return ids
@@ -180,6 +181,103 @@ func requireJSONEqual(t *testing.T, got, want json.RawMessage) {
 
 	if !reflect.DeepEqual(gotValue, wantValue) {
 		t.Fatalf("payload = %s, want %s", got, want)
+	}
+}
+
+func TestCreateInputReturnsCreatedProcess(t *testing.T) {
+	env := newQueueTestEnv(t, "step10-test-create-input")
+	ctx := queueTestContext(t)
+
+	created, err := env.database.CreateInput(
+		ctx,
+		env.source,
+		json.RawMessage(`{"tool":"echo-test","message":"step10"}`),
+	)
+	if err != nil {
+		t.Fatalf("create input: %v", err)
+	}
+	if created.InputID == uuid.Nil {
+		t.Fatal("CreateInput returned a nil input UUID")
+	}
+	if created.ProcessID == uuid.Nil {
+		t.Fatal("CreateInput returned a nil process UUID")
+	}
+	if created.Status != "new" {
+		t.Fatalf("input status = %q, want new", created.Status)
+	}
+
+	var storedStatus string
+	if err := env.pool.QueryRow(
+		ctx,
+		"SELECT status FROM sm_inputs WHERE id = $1",
+		created.InputID,
+	).Scan(&storedStatus); err != nil {
+		t.Fatalf("query stored input: %v", err)
+	}
+	if storedStatus != created.Status {
+		t.Fatalf("stored status = %q, want %q", storedStatus, created.Status)
+	}
+
+	var processID uuid.UUID
+	if err := env.pool.QueryRow(
+		ctx,
+		"SELECT id FROM sm_processes WHERE input_id = $1",
+		created.InputID,
+	).Scan(&processID); err != nil {
+		t.Fatalf("query created process: %v", err)
+	}
+	if processID != created.ProcessID {
+		t.Fatalf("process ID = %s, want %s", processID, created.ProcessID)
+	}
+}
+
+func TestCreateInputRollsBackWhenProcessIsMissing(t *testing.T) {
+	env := newQueueTestEnv(t, "step10-test-create-input-without-process")
+	ctx := queueTestContext(t)
+
+	if _, err := env.pool.Exec(
+		ctx,
+		"ALTER TABLE sm_inputs DISABLE TRIGGER trg_sm_inputs_after_insert",
+	); err != nil {
+		t.Fatalf("disable input trigger: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if _, err := env.pool.Exec(
+			cleanupCtx,
+			"ALTER TABLE sm_inputs ENABLE TRIGGER trg_sm_inputs_after_insert",
+		); err != nil {
+			t.Errorf("enable input trigger: %v", err)
+		}
+	})
+
+	created, err := env.database.CreateInput(
+		ctx,
+		env.source,
+		json.RawMessage(`{"tool":"echo-test"}`),
+	)
+	if err == nil {
+		t.Fatal("CreateInput succeeded without a generated process")
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("CreateInput error = %v, want wrapped pgx.ErrNoRows", err)
+	}
+	if created != (db.CreatedInput{}) {
+		t.Fatalf("CreateInput returned data after rollback: %+v", created)
+	}
+
+	var inputCount int
+	if err := env.pool.QueryRow(
+		ctx,
+		"SELECT COUNT(*) FROM sm_inputs WHERE source = $1",
+		env.source,
+	).Scan(&inputCount); err != nil {
+		t.Fatalf("count rolled back inputs: %v", err)
+	}
+	if inputCount != 0 {
+		t.Fatalf("rolled back input count = %d, want 0", inputCount)
 	}
 }
 

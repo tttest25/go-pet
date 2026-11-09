@@ -27,7 +27,7 @@ type fakeDatabase struct {
 	createInputErr error
 	updateErr      error
 
-	inputID uuid.UUID
+	createdInput db.CreatedInput
 
 	pingCalls        int
 	createInputCalls int
@@ -42,7 +42,13 @@ type fakeDatabase struct {
 }
 
 func newFakeDatabase() *fakeDatabase {
-	return &fakeDatabase{inputID: uuid.New()}
+	return &fakeDatabase{
+		createdInput: db.CreatedInput{
+			InputID:   uuid.New(),
+			ProcessID: uuid.New(),
+			Status:    "new",
+		},
+	}
 }
 
 func (f *fakeDatabase) Ping(context.Context) error {
@@ -54,14 +60,14 @@ func (f *fakeDatabase) CreateInput(
 	_ context.Context,
 	source string,
 	payload json.RawMessage,
-) (uuid.UUID, error) {
+) (db.CreatedInput, error) {
 	f.createInputCalls++
 	f.source = source
 	f.payload = payload
 	if f.createInputErr != nil {
-		return uuid.Nil, f.createInputErr
+		return db.CreatedInput{}, f.createInputErr
 	}
-	return f.inputID, nil
+	return f.createdInput, nil
 }
 
 func (f *fakeDatabase) UpdateJobStatus(
@@ -179,9 +185,43 @@ func TestCreateInput(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &responseBody); err != nil {
 		t.Fatalf("decode create response: %v", err)
 	}
-	if responseBody.ID != database.inputID {
-		t.Fatalf("response ID = %s, want %s", responseBody.ID, database.inputID)
+	if responseBody.InputID == uuid.Nil || responseBody.ProcessID == uuid.Nil {
+		t.Fatalf("response contains nil UUID: %+v", responseBody)
 	}
+	if responseBody.InputID != database.createdInput.InputID {
+		t.Fatalf(
+			"response input ID = %s, want %s",
+			responseBody.InputID,
+			database.createdInput.InputID,
+		)
+	}
+	if responseBody.ProcessID != database.createdInput.ProcessID {
+		t.Fatalf(
+			"response process ID = %s, want %s",
+			responseBody.ProcessID,
+			database.createdInput.ProcessID,
+		)
+	}
+	if responseBody.Status != "new" {
+		t.Fatalf("response status = %q, want new", responseBody.Status)
+	}
+	if responseBody.ID != responseBody.InputID {
+		t.Fatalf("legacy response ID = %s, want input ID %s", responseBody.ID, responseBody.InputID)
+	}
+
+	var responseFields map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &responseFields); err != nil {
+		t.Fatalf("decode create response fields: %v", err)
+	}
+	if len(responseFields) != 4 {
+		t.Fatalf("response fields = %v, want exactly four fields", responseFields)
+	}
+	for _, field := range []string{"input_id", "process_id", "status", "id"} {
+		if _, ok := responseFields[field]; !ok {
+			t.Errorf("response field %q is missing", field)
+		}
+	}
+
 	if database.createInputCalls != 1 {
 		t.Fatalf("CreateInput calls = %d, want 1", database.createInputCalls)
 	}
@@ -263,21 +303,39 @@ func TestCreateInputValidation(t *testing.T) {
 }
 
 func TestCreateInputDatabaseError(t *testing.T) {
-	database := newFakeDatabase()
-	database.createInputErr = errors.New("sensitive insert failure")
-	server := newServer(database, apiTestLogger())
-
-	response := performRequest(
-		server,
-		http.MethodPost,
-		"/api/v1/inputs",
-		`{"source":"manual","payload":{"tool":"echo-test"}}`,
-	)
-	if response.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500", response.Code)
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "insert failure",
+			err:  errors.New("sensitive insert failure"),
+		},
+		{
+			name: "created process is missing",
+			err:  fmt.Errorf("sensitive process lookup failure: %w", pgx.ErrNoRows),
+		},
 	}
-	if strings.Contains(response.Body.String(), "sensitive") {
-		t.Fatalf("response leaked internal error: %s", response.Body)
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			database := newFakeDatabase()
+			database.createInputErr = test.err
+			server := newServer(database, apiTestLogger())
+
+			response := performRequest(
+				server,
+				http.MethodPost,
+				"/api/v1/inputs",
+				`{"source":"manual","payload":{"tool":"echo-test"}}`,
+			)
+			if response.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want 500", response.Code)
+			}
+			if strings.Contains(response.Body.String(), "sensitive") {
+				t.Fatalf("response leaked internal error: %s", response.Body)
+			}
+		})
 	}
 }
 
@@ -517,17 +575,34 @@ func TestServerIntegration(t *testing.T) {
 		t.Fatalf("decode integration input ID: %v", err)
 	}
 	response.Body.Close()
+	if created.InputID == uuid.Nil || created.ProcessID == uuid.Nil {
+		t.Fatalf("integration response contains nil UUID: %+v", created)
+	}
+	if created.Status != "new" {
+		t.Fatalf("integration input status = %q, want new", created.Status)
+	}
+	if created.ID != created.InputID {
+		t.Fatalf(
+			"integration legacy ID = %s, want input ID %s",
+			created.ID,
+			created.InputID,
+		)
+	}
 
 	var jobID uuid.UUID
+	var processID uuid.UUID
 	if err := verification.QueryRow(
 		ctx,
-		`SELECT j.id
+		`SELECT j.id, p.id
 		 FROM sm_jobs j
 		 JOIN sm_processes p ON p.id = j.process_id
 		 WHERE p.input_id = $1`,
-		created.ID,
-	).Scan(&jobID); err != nil {
+		created.InputID,
+	).Scan(&jobID, &processID); err != nil {
 		t.Fatalf("query integration job: %v", err)
+	}
+	if processID != created.ProcessID {
+		t.Fatalf("database process ID = %s, want %s", processID, created.ProcessID)
 	}
 	if _, err := verification.Exec(
 		ctx,

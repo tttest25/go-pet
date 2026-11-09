@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -15,7 +16,13 @@ const (
 	createInputQuery = `
 INSERT INTO sm_inputs (source, payload)
 VALUES ($1, $2)
-RETURNING id`
+RETURNING id, status`
+	findCreatedProcessQuery = `
+SELECT id
+FROM sm_processes
+WHERE input_id = $1
+ORDER BY created_at ASC
+LIMIT 1`
 	pickNextJobQuery = `
 UPDATE sm_jobs
 SET
@@ -62,22 +69,58 @@ VALUES (
 )`
 )
 
+type CreatedInput struct {
+	InputID   uuid.UUID
+	ProcessID uuid.UUID
+	Status    string
+}
+
 func (d *DB) CreateInput(
 	ctx context.Context,
 	source string,
 	payload json.RawMessage,
-) (uuid.UUID, error) {
-	var inputID uuid.UUID
-	if err := d.pool.QueryRow(
+) (CreatedInput, error) {
+	tx, err := d.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return CreatedInput{}, fmt.Errorf(
+			"begin create input from source %q: %w",
+			source,
+			err,
+		)
+	}
+	defer func() {
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tx.Rollback(rollbackCtx)
+	}()
+
+	var created CreatedInput
+	if err := tx.QueryRow(
 		ctx,
 		createInputQuery,
 		source,
 		payload,
-	).Scan(&inputID); err != nil {
-		return uuid.Nil, fmt.Errorf("create input from source %q: %w", source, err)
+	).Scan(&created.InputID, &created.Status); err != nil {
+		return CreatedInput{}, fmt.Errorf("create input from source %q: %w", source, err)
 	}
 
-	return inputID, nil
+	if err := tx.QueryRow(
+		ctx,
+		findCreatedProcessQuery,
+		created.InputID,
+	).Scan(&created.ProcessID); err != nil {
+		return CreatedInput{}, fmt.Errorf(
+			"find created process for input %s: %w",
+			created.InputID,
+			err,
+		)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return CreatedInput{}, fmt.Errorf("commit create input %s: %w", created.InputID, err)
+	}
+
+	return created, nil
 }
 
 func (d *DB) PickNextJob(ctx context.Context) (*Job, error) {

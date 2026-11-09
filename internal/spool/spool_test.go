@@ -453,7 +453,7 @@ func TestSpoolWorkerIntegration(t *testing.T) {
 	worker := NewWorker(database, writer, time.Hour, testLogger())
 	_, _ = startTestWorker(t, worker)
 
-	inputID, err := database.CreateInput(
+	created, err := database.CreateInput(
 		setupCtx,
 		source,
 		json.RawMessage(`{"tool":"echo-test","message":"integration"}`),
@@ -469,7 +469,7 @@ func TestSpoolWorkerIntegration(t *testing.T) {
 		 FROM sm_jobs j
 		 JOIN sm_processes p ON p.id = j.process_id
 		 WHERE p.input_id = $1`,
-		inputID,
+		created.InputID,
 	).Scan(&jobID); err != nil {
 		t.Fatalf("query integration job: %v", err)
 	}
