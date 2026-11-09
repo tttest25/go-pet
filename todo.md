@@ -63,7 +63,7 @@
   - Покрыть изменения юнит/интеграционными тестами и проверить сквозную прослеживаемость в логах.
   - Сделать git commit.
 
-- [ ] **Step 9: Multi-stage `Dockerfile` и интеграция в `docker-compose.yml`**
+- [x] **Step 9: Multi-stage `Dockerfile` и интеграция в `docker-compose.yml`**
   - Создать легковесный Multi-stage `Dockerfile` (`golang:1.23-alpine` -> `alpine:3.20`, непривилегированный пользователь, образ ~20 МБ).
   - Добавить сервис `app` (`petar_app`) и `healthcheck` для `postgres` в `/opt/go-pet/docker-compose.yml` с сохранением всех путей `/opt/go-pet/postgres/`.
   - Запустить весь стек через `docker compose up -d --build` и проверить прохождение E2E-теста.
