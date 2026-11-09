@@ -42,3 +42,7 @@ coverage.html
 Thumbs.db
 spool/processing/*
 !spool/processing/.gitkeep
+
+# Служебные файлы выгрузки проекта
+bundle.py
+project_bundle_go_pet.txt

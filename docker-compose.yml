@@ -49,4 +49,5 @@ services:
 
 networks:
   petar_net:
+    name: petar_shared_net
     driver: bridge
