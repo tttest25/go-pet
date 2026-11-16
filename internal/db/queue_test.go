@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"petar/internal/config"
@@ -844,4 +845,193 @@ func TestPickNextJobConcurrent(t *testing.T) {
 		}
 		requireJobStatus(t, ctx, env.pool, wantID, db.StatusDispatched)
 	}
+}
+
+func TestDBStateFunctions(t *testing.T) {
+	env := newQueueTestEnv(t, "step11-test-state-functions-"+uuid.NewString())
+	ctx := queueTestContext(t)
+	payload := json.RawMessage(`{"tool":"echo-test","message":"state functions"}`)
+
+	tx, err := env.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin queue isolation: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tx.Rollback(cleanupCtx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+			t.Errorf("release queue isolation: %v", err)
+		}
+	})
+	if _, err := tx.Exec(ctx, "LOCK TABLE sm_jobs IN ACCESS EXCLUSIVE MODE"); err != nil {
+		t.Fatalf("lock queue: %v", err)
+	}
+	// Remove unrelated pending jobs only within this transaction; rollback restores them.
+	if _, err := tx.Exec(ctx, "DELETE FROM sm_jobs WHERE status = 'pending'"); err != nil {
+		t.Fatalf("isolate pending queue: %v", err)
+	}
+
+	requireSQLState := func(t *testing.T, err error, code string) {
+		t.Helper()
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != code {
+			t.Fatalf("error = %v, want SQLSTATE %s", err, code)
+		}
+	}
+
+	create := func(t *testing.T) testJobIDs {
+		t.Helper()
+		var ids testJobIDs
+		var status string
+		if err := tx.QueryRow(ctx, "SELECT * FROM sm_create_input($1, $2)",
+			env.source, payload).Scan(&ids.inputID, &ids.processID, &status); err != nil {
+			t.Fatalf("call sm_create_input: %v", err)
+		}
+		if ids.inputID == uuid.Nil || ids.processID == uuid.Nil || status != "new" {
+			t.Fatalf("created input = %+v, status = %q", ids, status)
+		}
+		if err := tx.QueryRow(ctx,
+			"SELECT id FROM sm_jobs WHERE process_id = $1 AND process_id IN (SELECT id FROM sm_processes WHERE input_id = $2)",
+			ids.processID, ids.inputID).Scan(&ids.jobID); err != nil {
+			t.Fatalf("query created process and job: %v", err)
+		}
+		return ids
+	}
+
+	requireStatus := func(id uuid.UUID, want db.Status) {
+		t.Helper()
+		var got db.Status
+		if err := tx.QueryRow(ctx, "SELECT status FROM sm_jobs WHERE id = $1", id).Scan(&got); err != nil {
+			t.Fatalf("query job status: %v", err)
+		}
+		if got != want {
+			t.Fatalf("job status = %q, want %q", got, want)
+		}
+	}
+	requireState := func(id uuid.UUID, want string) {
+		t.Helper()
+		var got string
+		if err := tx.QueryRow(ctx, "SELECT state FROM sm_processes WHERE id = $1", id).Scan(&got); err != nil {
+			t.Fatalf("query process state: %v", err)
+		}
+		if got != want {
+			t.Fatalf("process state = %q, want %q", got, want)
+		}
+	}
+
+	low := create(t)
+	newer := create(t)
+	older := create(t)
+	base := time.Now().Add(-time.Hour)
+	for _, item := range []struct {
+		id       uuid.UUID
+		priority int
+		created  time.Time
+	}{
+		{low.jobID, 0, base.Add(-time.Minute)},
+		{newer.jobID, 10, base.Add(time.Minute)},
+		{older.jobID, 10, base},
+	} {
+		if _, err := tx.Exec(ctx, "UPDATE sm_jobs SET priority = $2, created_at = $3 WHERE id = $1",
+			item.id, item.priority, item.created); err != nil {
+			t.Fatalf("prepare job ordering: %v", err)
+		}
+	}
+
+	update := func(id uuid.UUID, status any, result, message string) error {
+		if _, err := tx.Exec(ctx, "SAVEPOINT before_update"); err != nil {
+			t.Fatalf("create update savepoint: %v", err)
+		}
+		_, err := tx.Exec(ctx, "SELECT sm_update_job_status($1, $2, $3, $4)", id, status, result, message)
+		if err != nil {
+			if _, rollbackErr := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT before_update"); rollbackErr != nil {
+				t.Fatalf("roll back failed update: %v", rollbackErr)
+			}
+		}
+		if _, releaseErr := tx.Exec(ctx, "RELEASE SAVEPOINT before_update"); releaseErr != nil {
+			t.Fatalf("release update savepoint: %v", releaseErr)
+		}
+		return err
+	}
+	requireSQLState(t, update(low.jobID, "completed", "/result", ""), "P0002")
+	requireSQLState(t, update(uuid.New(), "in_progress", "", ""), "P0002")
+	requireSQLState(t, update(low.jobID, "unknown", "", ""), "22023")
+	requireSQLState(t, update(low.jobID, nil, "", ""), "22023")
+	requireStatus(low.jobID, db.StatusPending)
+
+	for _, want := range []testJobIDs{older, newer, low} {
+		var job db.Job
+		err := tx.QueryRow(ctx, "SELECT * FROM sm_pick_next_job()").Scan(
+			&job.ID, &job.ProcessID, &job.ToolName, &job.Payload, &job.OldStatus, &job.Status)
+		if err != nil {
+			t.Fatalf("call sm_pick_next_job: %v", err)
+		}
+		if job.ID != want.jobID || job.ProcessID != want.processID || job.ToolName != "echo-test" ||
+			job.OldStatus != db.StatusPending || job.Status != db.StatusDispatched {
+			t.Fatalf("picked job = %+v, want job %s pending -> dispatched", job, want.jobID)
+		}
+		requireJSONEqual(t, job.Payload, payload)
+		requireState(want.processID, "running")
+	}
+	var unused uuid.UUID
+	if err := tx.QueryRow(ctx, "SELECT id FROM sm_pick_next_job()").Scan(&unused); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("pick from empty queue: %v, want no rows", err)
+	}
+
+	if err := update(older.jobID, "in_progress", "", ""); err != nil {
+		t.Fatalf("mark in progress: %v", err)
+	}
+	const resultPath = "/spool/out/state-functions/result.json"
+	if err := update(older.jobID, "completed", resultPath, ""); err != nil {
+		t.Fatalf("complete job: %v", err)
+	}
+	requireStatus(older.jobID, db.StatusCompleted)
+	requireState(older.processID, "completed")
+	requireSQLState(t, update(older.jobID, "completed", resultPath, ""), "P0002")
+	var outputCount int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM sm_outputs
+		WHERE process_id = $1 AND artifact_type = 'result' AND metadata->>'result_path' = $2`,
+		older.processID, resultPath).Scan(&outputCount); err != nil || outputCount != 1 {
+		t.Fatalf("completed output count = %d, err = %v; want 1", outputCount, err)
+	}
+	if err := update(newer.jobID, "failed", "", "test failure"); err != nil {
+		t.Fatalf("fail job: %v", err)
+	}
+	requireStatus(newer.jobID, db.StatusFailed)
+	requireState(newer.processID, "failed")
+	var message string
+	if err := tx.QueryRow(ctx, "SELECT error_msg FROM sm_jobs WHERE id = $1", newer.jobID).Scan(&message); err != nil || message != "test failure" {
+		t.Fatalf("failure message = %q, err = %v", message, err)
+	}
+
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("roll back queue isolation: %v", err)
+	}
+
+	t.Run("missing process rolls back input", func(t *testing.T) {
+		rollbackSource := env.source + "-rollback"
+		// Register restoration before disabling the trigger, including on ambiguous errors.
+		t.Cleanup(func() {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, err := env.pool.Exec(cleanupCtx, "ALTER TABLE sm_inputs ENABLE TRIGGER trg_sm_inputs_after_insert"); err != nil {
+				t.Errorf("enable input trigger: %v", err)
+			}
+			if _, err := env.pool.Exec(cleanupCtx, "DELETE FROM sm_inputs WHERE source = $1", rollbackSource); err != nil {
+				t.Errorf("clean up trigger test input: %v", err)
+			}
+		})
+		if _, err := env.pool.Exec(ctx, "ALTER TABLE sm_inputs DISABLE TRIGGER trg_sm_inputs_after_insert"); err != nil {
+			t.Fatalf("disable input trigger: %v", err)
+		}
+		var inputID, processID uuid.UUID
+		var status string
+		err := env.pool.QueryRow(ctx, "SELECT * FROM sm_create_input($1, $2)", rollbackSource, payload).
+			Scan(&inputID, &processID, &status)
+		requireSQLState(t, err, "P0002")
+		var count int
+		if err := env.pool.QueryRow(ctx, "SELECT count(*) FROM sm_inputs WHERE source = $1", rollbackSource).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("rolled back input count = %d, err = %v; want 0", count, err)
+		}
+	})
 }

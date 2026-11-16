@@ -82,7 +82,7 @@
 
 ## Phase 2: PostgreSQL State Machine Functions & Query API
 
-- [ ] **Step 11: Миграция хранимых функций БД (`000003_db_state_functions`)**
+- [x] **Step 11: Миграция хранимых функций БД (`000003_db_state_functions`)**
   - Создать `/opt/go-pet/postgres/migrations/000003_db_state_functions.up.sql` и `.down.sql`.
   - Реализовать PL/pgSQL-функции для инкапсуляции мутаций:
     - `sm_create_input(p_source TEXT, p_payload JSONB)` — вставка в `sm_inputs` и возврат `(input_id UUID, process_id UUID, status TEXT)`.

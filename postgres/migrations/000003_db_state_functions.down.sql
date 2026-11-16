@@ -1,0 +1,3 @@
+DROP FUNCTION IF EXISTS sm_update_job_status(UUID, TEXT, TEXT, TEXT);
+DROP FUNCTION IF EXISTS sm_pick_next_job();
+DROP FUNCTION IF EXISTS sm_create_input(TEXT, JSONB);
