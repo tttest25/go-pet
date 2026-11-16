@@ -33,6 +33,7 @@ coverage.html
 # Кэш и логи OpenCode / редакторов
 .opencode/cache/
 .opencode/sessions/
+.opencode/tasks/
 *.log
 
 # Системные и IDE файлы
@@ -46,3 +47,4 @@ spool/processing/*
 # Служебные файлы выгрузки проекта
 bundle.py
 project_bundle_go_pet.txt
+.opencode/tasks/

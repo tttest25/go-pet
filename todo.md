@@ -75,3 +75,38 @@
   - Адаптировать тесты и фейки `databaseAPI` (`internal/api/server_test.go`, `internal/db/queue_test.go`): новые ожидания пишутся первыми и должны падать (red), затем реализация (green); проверить валидность UUID `input_id`/`process_id` и `status == "new"`.
   - Проверка: `go test -v -race ./...`, `go build ./cmd/petar`, пересборка и рестарт контейнера `petar_app`, probe-команда возвращает три обязательных поля, отправка формы из DokuWiki (пользователь @ai/@admin) показывает Input ID / Process ID и пишет `data-input-id`/`data-process-id` в DOM.
   - Сделать git commit: `fix: return input_id/process_id/status from POST /api/v1/inputs`
+
+
+
+---
+
+## Phase 2: PostgreSQL State Machine Functions & Query API
+
+- [ ] **Step 11: Миграция хранимых функций БД (`000003_db_state_functions`)**
+  - Создать `/opt/go-pet/postgres/migrations/000003_db_state_functions.up.sql` и `.down.sql`.
+  - Реализовать PL/pgSQL-функции для инкапсуляции мутаций:
+    - `sm_create_input(p_source TEXT, p_payload JSONB)` — вставка в `sm_inputs` и возврат `(input_id UUID, process_id UUID, status TEXT)`.
+    - `sm_pick_next_job()` — атомарный захват `pending`-задачи (`FOR UPDATE SKIP LOCKED`), перевод в `dispatched` с `RETURNING OLD.status, NEW.status` и возврат полей задачи.
+    - `sm_update_job_status(p_job_id UUID, p_status TEXT, p_result_path TEXT, p_error_msg TEXT)` — валидация перехода (`dispatched`/`in_progress` -> `in_progress`/`completed`/`failed`), обновление `sm_jobs` и запись в `sm_outputs` при `completed`.
+  - Проверить идемпотентность миграции и работу функций SQL-тестом в `petar_postgres`.
+  - Сделать git commit: `feat(db): add PostgreSQL 18 state machine functions`
+
+- [ ] **Step 12: Перевод `internal/db` на вызов хранимых функций**
+  - Обновить `internal/db/queue.go`: заменить сырые SQL-транзакции в `CreateInput`, `PickNextJob` и `UpdateJobStatus` на вызовы `SELECT * FROM sm_create_input(...)`, `SELECT * FROM sm_pick_next_job()`, `SELECT sm_update_job_status(...)`.
+  - Сохранить контракты возвращаемых ошибок (включая маппинг отсутствующей/необновляемой задачи в `pgx.ErrNoRows`).
+  - Прогнать существующие интеграционные тесты `internal/db/queue_test.go` и `internal/spool/spool_test.go` через `./scripts/quality-gate.sh` без изменения их логики.
+  - Сделать git commit: `refactor(db): delegate queue mutations to PostgreSQL functions`
+
+- [ ] **Step 13: Слой чтения статуса процесса и списка задач в `internal/db`**
+  - Добавить в `internal/db/models.go` структуры `ProcessDetails` (данные `sm_processes` + вложенный список его `sm_jobs` и `sm_outputs`) и `JobFilter` (`ProcessID`, `Status`, `Limit`, `CursorID`).
+  - Реализовать в `internal/db/queue.go` методы `GetProcess(ctx, processID)` (возврат `pgx.ErrNoRows`, если процесс не найден) и `ListJobs(ctx, filter)` (сортировка `ORDER BY created_at DESC, id DESC` с keyset-пагинацией по `uuidv7()`).
+  - Покрыть интеграционными тестами в `internal/db/queue_test.go`.
+  - Сделать git commit: `feat(db): add GetProcess and ListJobs queries`
+
+- [ ] **Step 14: HTTP API для статуса процесса и списка задач (`internal/api`)**
+  - Расширить интерфейс `databaseAPI` в `internal/api/server.go` методами `GetProcess` и `ListJobs`.
+  - Добавить эндпоинты (Go 1.23 `http.ServeMux`):
+    - `GET /api/v1/processes/{id}` — возврат `200 JSON` со статусом процесса, задачами и выходными артефактами (`400` на невалидный UUID, `404` если не найден).
+    - `GET /api/v1/jobs` — фильтрация по query-параметрам `?process_id=...&status=...&limit=...&cursor=...`.
+  - Покрыть тестами в `internal/api/server_test.go` (валидация, 404, сериализация JSON) и прогнать `./scripts/quality-gate.sh`.
+  - Сделать git commit: `feat(api): add process status and jobs list endpoints`

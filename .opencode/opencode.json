@@ -1,0 +1,241 @@
+{
+  "$schema": "https://opencode.ai",
+
+  "model": "google/gemini-3.1-flash-lite",
+
+  "instructions": [
+    "rules.md",
+    "architecture.md"
+  ],
+
+  "watcher": {
+    "ignore": [
+      "postgres/data/**",
+      "spool/in/**",
+      "spool/processing/**",
+      "spool/out/**",
+      ".git/**",
+      ".opencode/cache/**",
+      ".opencode/sessions/**",
+      "petar",
+      "*.log",
+      "project_bundle*.txt"
+    ]
+  },
+
+  "compaction": {
+    "auto": true
+  },
+
+  "providers": {
+    "local": {
+      "package": "@ai-sdk/openai-compatible",
+      "name": "Local LLM",
+      "settings": {
+        "baseURL": "http://localhost:4981/openai/v1"
+      },
+      "headers": {
+        "Authorization": "Bearer dummy"
+      },
+      "models": {
+        "gemini-quick-answers": {
+          "name": "Local LLM gemini-quick-answers",
+          "cost": {
+            "input": 0,
+            "output": 0
+          },
+          "limit": {
+            "context": 48000,
+            "output": 4096
+          }
+        }
+      }
+    },
+
+    "google": {
+      "name": "Google AI Studio (Free Tier)",
+      "models": {
+        "gemini-4-hydrogen": {
+          "name": "Google Gemini 4 Hydrogen",
+          "cost": {
+            "input": 0,
+            "output": 0
+          },
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          }
+        },
+        "gemini-3.8-flash": {
+          "name": "Google Gemini 3.8 Flash",
+          "cost": {
+            "input": 0,
+            "output": 0
+          },
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          }
+        },
+        "gemini-3.1-flash-lite": {
+          "name": "Google Gemini 3.1 Flash-Lite",
+          "cost": {
+            "input": 0,
+            "output": 0
+          },
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          }
+        },
+        "gemini-3.6-flash": {
+                  "name": "Google Gemini 3.6 Flash",
+                  "cost": { "input": 0, "output": 0 },
+                  "limit": { "context": 1048576, "output": 65536 }
+        },
+        "gemini-3-flash": {
+                  "name": "Google Gemini 3 Flash",
+                  "cost": { "input": 0, "output": 0 },
+                  "limit": { "context": 1048576, "output": 65536 }
+        }
+      }
+    },
+
+    "kimi-code-plan-global": {
+      "name": "Moonshot AI (Kimi For Coding)",
+      "models": {
+        "k3.1-pro": {
+          "name": "Moonshot AI Kimi K3.1 Pro",
+          "cost": {
+            "input": 0,
+            "output": 0
+          },
+          "limit": {
+            "context": 200000,
+            "output": 16384
+          }
+        },
+        "k3.1-pro-highspeed": {
+          "name": "Moonshot AI Kimi K3.1 Pro Highspeed",
+          "cost": {
+            "input": 0,
+            "output": 0
+          },
+          "limit": {
+            "context": 200000,
+            "output": 16384
+          }
+        }
+      }
+    }
+  },
+
+  "agents": {
+    "title": {
+      "model": "local/gemini-quick-answers"
+    },
+    "summary": {
+      "model": "local/gemini-quick-answers"
+    },
+
+    "plan": {
+      "description": "Архитектор на Google Gemini 4 Hydrogen (20 RPD). Записывает готовое ТЗ за 1-2 запроса.",
+      "mode": "primary",
+      "model": "google/gemini-4-hydrogen",
+      "system": "ВНИМАНИЕ: Лимит модели — 20 запросов в день! Инструменты glob и grep отключены. Прочитай целевые файлы по точным путям за один шаг и сразу запиши детальное ТЗ (с точными кусками кода/SQL) в .opencode/tasks/XX_name.md, чтобы его смогла легко реализовать модель Lite-уровня.",
+      "permissions": [
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "write", "resource": ".opencode/tasks/*.md", "effect": "allow" },
+        { "action": "write", "resource": "todo.md", "effect": "allow" },
+        { "action": "write", "resource": "*", "effect": "deny" },
+        { "action": "glob", "resource": "*", "effect": "deny" },
+        { "action": "grep", "resource": "*", "effect": "deny" },
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "bash", "resource": "*", "effect": "deny" }
+      ]
+    },
+
+    "plan-kimi": {
+      "description": "Старший архитектор на Moonshot AI Kimi K3.1 Pro (когда кончились 20 RPD Hydrogen или для сложного SQL)",
+      "mode": "primary",
+      "model": "kimi-code-plan-global/k3.1-pro",
+      "system": "Ты — главный архитектор проекта petar на лимитированной месячной квоте Moonshot AI. Инструменты glob и grep отключены. Создай самодостаточное ТЗ в .opencode/tasks/ за один проход без лишних вызовов тулов.",
+      "permissions": [
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "write", "resource": ".opencode/tasks/*.md", "effect": "allow" },
+        { "action": "write", "resource": "todo.md", "effect": "allow" },
+        { "action": "write", "resource": "*", "effect": "deny" },
+        { "action": "glob", "resource": "*", "effect": "deny" },
+        { "action": "grep", "resource": "*", "effect": "deny" },
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "bash", "resource": "*", "effect": "deny" }
+      ]
+    },
+
+    "build": {
+      "description": "Основной кодер TDD на Google Gemini 3.1 Flash-Lite (500 RPD / 15 RPM)",
+      "mode": "primary",
+      "model": "google/gemini-3.1-flash-lite",
+      "system": "Ты — исполнитель TDD проекта petar. Строго следуй готовому ТЗ из .opencode/tasks/. Шаг 1: напиши тест в *_test.go. Шаг 2: напиши код. Шаг 3: запусти ./scripts/quality-gate.sh.",
+      "permissions": [
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "write", "resource": "*", "effect": "allow" },
+        { "action": "edit", "resource": "*", "effect": "allow" },
+        { "action": "glob", "resource": "*", "effect": "allow" },
+        { "action": "grep", "resource": "*", "effect": "allow" },
+        { "action": "bash", "resource": "./scripts/quality-gate.sh", "effect": "allow" },
+        { "action": "bash", "resource": "go test*", "effect": "allow" },
+        { "action": "bash", "resource": "go vet*", "effect": "allow" },
+        { "action": "bash", "resource": "git status*", "effect": "allow" },
+        { "action": "bash", "resource": "git diff*", "effect": "allow" },
+        { "action": "bash", "resource": "git add*", "effect": "allow" },
+        { "action": "bash", "resource": "git commit*", "effect": "allow" },
+        { "action": "bash", "resource": "*", "effect": "ask" }
+      ]
+    },
+
+    "build-heavy": {
+      "description": "Сложный кодинг и фикс гонок на Google Gemini 3.8 Flash (20 RPD). При 429 переключай через /models на 3.6-flash -> 3-flash -> kimi-code-plan-global/k3.1-pro-highspeed",
+      "mode": "primary",
+      "model": "google/gemini-3.8-flash",
+      "system": "Квота — 20 запросов в день (5 RPM). Не делай лишних чтений! Внеси правки сразу в нужный файл и запусти ровно один раз ./scripts/quality-gate.sh.",
+      "permissions": [
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "write", "resource": "*", "effect": "allow" },
+        { "action": "edit", "resource": "*", "effect": "allow" },
+        { "action": "bash", "resource": "*", "effect": "allow" },
+        { "action": "glob", "resource": "*", "effect": "deny" },
+        { "action": "grep", "resource": "*", "effect": "deny" }
+      ]
+    },
+
+    "review": {
+      "description": "Агент-критик (Bounded Review Loop до 2 итераций) на пуле 500 RPD",
+      "mode": "subagent",
+      "model": "google/gemini-3.1-flash-lite",
+      "system": "Запусти git diff и проверь код строго по 5 пунктам из rules.md (4 пакета, ctx первым аргументом, %w для ошибок, uuidv7/RETURNING в PG18, атомарность файлов). Если все ок — выведи 'VERDICT: PASS'. Иначе до 3 ошибок FILE:LINE.",
+      "permissions": [
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "bash", "resource": "git diff*", "effect": "allow" },
+        { "action": "bash", "resource": "git status*", "effect": "allow" },
+        { "action": "bash", "resource": "*", "effect": "deny" },
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "write", "resource": "*", "effect": "deny" }
+      ]
+    },
+
+    "explore": {
+      "description": "Быстрый поиск по кодовой базе за счет пула 500 RPD",
+      "mode": "subagent",
+      "model": "google/gemini-3.1-flash-lite",
+      "permissions": [
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "glob", "resource": "*", "effect": "allow" },
+        { "action": "grep", "resource": "*", "effect": "allow" },
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "write", "resource": "*", "effect": "deny" },
+        { "action": "bash", "resource": "*", "effect": "deny" }
+      ]
+    }
+  }
+}
