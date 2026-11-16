@@ -8,7 +8,10 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -20,6 +23,8 @@ const maxRequestBodyBytes = 1 << 20
 
 type databaseAPI interface {
 	Ping(ctx context.Context) error
+	GetProcess(ctx context.Context, processID uuid.UUID) (db.ProcessDetails, error)
+	ListJobs(ctx context.Context, filter db.JobFilter) ([]db.JobDetails, error)
 
 	CreateInput(
 		ctx context.Context,
@@ -68,6 +73,52 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
+type processDetailsResponse struct {
+	ID        uuid.UUID               `json:"id"`
+	InputID   uuid.UUID               `json:"input_id"`
+	State     string                  `json:"state"`
+	Context   json.RawMessage         `json:"context"`
+	CreatedAt time.Time               `json:"created_at"`
+	UpdatedAt time.Time               `json:"updated_at"`
+	Jobs      []jobDetailsResponse    `json:"jobs"`
+	Outputs   []outputDetailsResponse `json:"outputs"`
+}
+
+type jobDetailsResponse struct {
+	ID         uuid.UUID       `json:"id"`
+	ProcessID  uuid.UUID       `json:"process_id"`
+	ToolName   string          `json:"tool_name"`
+	Payload    json.RawMessage `json:"payload"`
+	Status     db.Status       `json:"status"`
+	Priority   int             `json:"priority"`
+	ResultPath *string         `json:"result_path"`
+	ErrorMsg   *string         `json:"error_msg"`
+	CreatedAt  time.Time       `json:"created_at"`
+	UpdatedAt  time.Time       `json:"updated_at"`
+}
+
+type outputDetailsResponse struct {
+	ID           uuid.UUID       `json:"id"`
+	ProcessID    uuid.UUID       `json:"process_id"`
+	ArtifactType string          `json:"artifact_type"`
+	Content      *string         `json:"content"`
+	Metadata     json.RawMessage `json:"metadata"`
+	CreatedAt    time.Time       `json:"created_at"`
+}
+
+func jobsResponse(jobs []db.JobDetails) []jobDetailsResponse {
+	result := make([]jobDetailsResponse, len(jobs))
+	for i, job := range jobs {
+		result[i] = jobDetailsResponse{
+			ID: job.ID, ProcessID: job.ProcessID, ToolName: job.ToolName,
+			Payload: job.Payload, Status: job.Status, Priority: job.Priority,
+			ResultPath: job.ResultPath, ErrorMsg: job.ErrorMsg,
+			CreatedAt: job.CreatedAt, UpdatedAt: job.UpdatedAt,
+		}
+	}
+	return result
+}
+
 func NewServer(database *db.DB, logger *slog.Logger) *Server {
 	return newServer(database, logger)
 }
@@ -85,6 +136,8 @@ func newServer(database databaseAPI, logger *slog.Logger) *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", server.handleHealthz)
 	mux.HandleFunc("GET /readyz", server.handleReadyz)
+	mux.HandleFunc("GET /api/v1/processes/{id}", server.handleGetProcess)
+	mux.HandleFunc("GET /api/v1/jobs", server.handleListJobs)
 	mux.HandleFunc("POST /api/v1/inputs", server.handleCreateInput)
 	mux.HandleFunc(
 		"POST /api/v1/jobs/{id}/status",
@@ -101,6 +154,94 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	s.writeJSON(w, http.StatusOK, statusResponse{Status: "ok"})
+}
+
+func (s *Server) handleGetProcess(w http.ResponseWriter, r *http.Request) {
+	processID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid process ID")
+		return
+	}
+	process, err := s.database.GetProcess(r.Context(), processID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			s.writeError(w, http.StatusNotFound, "process not found")
+			return
+		}
+		s.logger.Error("get process through HTTP API failed",
+			"method", r.Method, "path", r.URL.Path, "process_id", processID, "error", err)
+		s.writeError(w, http.StatusInternalServerError, "failed to get process")
+		return
+	}
+	outputs := make([]outputDetailsResponse, len(process.Outputs))
+	for i, output := range process.Outputs {
+		outputs[i] = outputDetailsResponse{
+			ID: output.ID, ProcessID: output.ProcessID, ArtifactType: output.ArtifactType,
+			Content: output.Content, Metadata: output.Metadata, CreatedAt: output.CreatedAt,
+		}
+	}
+	s.writeJSON(w, http.StatusOK, processDetailsResponse{
+		ID: process.ID, InputID: process.InputID, State: process.State, Context: process.Context,
+		CreatedAt: process.CreatedAt, UpdatedAt: process.UpdatedAt,
+		Jobs: jobsResponse(process.Jobs), Outputs: outputs,
+	})
+}
+
+func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid query parameters")
+		return
+	}
+	filter := db.JobFilter{Limit: 20}
+	for _, name := range []string{"process_id", "status", "limit", "cursor"} {
+		values, present := query[name]
+		if !present {
+			continue
+		}
+		if len(values) != 1 || values[0] == "" {
+			s.writeError(w, http.StatusBadRequest, "invalid "+name)
+			return
+		}
+		value := values[0]
+		switch name {
+		case "process_id", "cursor":
+			id, err := uuid.Parse(value)
+			if err != nil {
+				s.writeError(w, http.StatusBadRequest, "invalid "+name)
+				return
+			}
+			if name == "process_id" {
+				filter.ProcessID = &id
+			} else {
+				filter.CursorID = &id
+			}
+		case "status":
+			status := db.Status(value)
+			switch status {
+			case db.StatusPending, db.StatusDispatched, db.StatusInProgress, db.StatusCompleted, db.StatusFailed:
+				filter.Status = &status
+			default:
+				s.writeError(w, http.StatusBadRequest, "invalid status")
+				return
+			}
+		case "limit":
+			limit, err := strconv.Atoi(value)
+			if err != nil || limit <= 0 {
+				s.writeError(w, http.StatusBadRequest, "invalid limit")
+				return
+			}
+			filter.Limit = min(limit, 100)
+		}
+	}
+	jobs, err := s.database.ListJobs(r.Context(), filter)
+	if err != nil {
+		s.logger.Error("list jobs through HTTP API failed",
+			"method", r.Method, "path", r.URL.Path, "error", err)
+		s.writeError(w, http.StatusInternalServerError, "failed to list jobs")
+		return
+	}
+	s.writeJSON(w, http.StatusOK, jobsResponse(jobs))
 }
 
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {

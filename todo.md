@@ -103,7 +103,7 @@
   - Покрыть интеграционными тестами в `internal/db/queue_test.go`.
   - Сделать git commit: `feat(db): add GetProcess and ListJobs queries`
 
-- [ ] **Step 14: HTTP API для статуса процесса и списка задач (`internal/api`)**
+- [x] **Step 14: HTTP API для статуса процесса и списка задач (`internal/api`)**
   - Расширить интерфейс `databaseAPI` в `internal/api/server.go` методами `GetProcess` и `ListJobs`.
   - Добавить эндпоинты (Go 1.23 `http.ServeMux`):
     - `GET /api/v1/processes/{id}` — возврат `200 JSON` со статусом процесса, задачами и выходными артефактами (`400` на невалидный UUID, `404` если не найден).
