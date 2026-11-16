@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +19,526 @@ import (
 	"petar/internal/config"
 	"petar/internal/db"
 )
+
+// readFixture is committed before read methods use their own pool connections.
+// Both processes belong to env.source, so the existing cleanup owns every row.
+type readFixture struct {
+	process db.ProcessDetails
+	other   db.ProcessDetails
+}
+
+func readFixtureTime() time.Time {
+	return time.Date(2025, time.January, 2, 3, 4, 5, 123456000, time.UTC)
+}
+
+func newReadFixture(ctx context.Context, t *testing.T, env *queueTestEnv, count int, prepare ...func(pgx.Tx, *readFixture)) readFixture {
+	t.Helper()
+	tx, err := env.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin read fixture: %v", err)
+	}
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tx.Rollback(cleanupCtx); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+			t.Errorf("roll back read fixture: %v", err)
+		}
+	}()
+
+	build := func(count int) db.ProcessDetails {
+		p := db.ProcessDetails{
+			State: "running", Context: json.RawMessage(`{"nested":{"enabled":true},"items":[1,"two",null]}`),
+			CreatedAt: readFixtureTime(), UpdatedAt: readFixtureTime().Add(time.Hour),
+			Jobs: make([]db.JobDetails, 0, count), Outputs: make([]db.OutputDetails, 0),
+		}
+		if err := tx.QueryRow(ctx, `INSERT INTO sm_inputs (source, payload)
+			VALUES ($1, '{"tool":"echo-test"}'::jsonb) RETURNING id`, env.source).Scan(&p.InputID); err != nil {
+			t.Fatalf("insert read input: %v", err)
+		}
+		if err := tx.QueryRow(ctx, `SELECT id FROM sm_processes WHERE input_id=$1`, p.InputID).Scan(&p.ID); err != nil {
+			t.Fatalf("query read process: %v", err)
+		}
+		var initial uuid.UUID
+		if err := tx.QueryRow(ctx, `UPDATE sm_jobs SET status='dispatched'
+			WHERE process_id=$1 RETURNING id`, p.ID).Scan(&initial); err != nil {
+			t.Fatalf("dispatch read fixture before commit: %v", err)
+		}
+		for i := 0; i < count; i++ {
+			job := db.JobDetails{
+				ProcessID: p.ID, ToolName: "echo-test",
+				Payload: json.RawMessage(`{"nested":{"message":"read"},"values":[true,2,null]}`),
+				Status:  db.StatusDispatched, Priority: i - 3,
+				CreatedAt: readFixtureTime().Add(time.Duration(i%3) * time.Minute),
+				UpdatedAt: readFixtureTime().Add(time.Duration(i+1) * time.Hour),
+			}
+			switch i % 3 {
+			case 1:
+				job.Status = db.StatusCompleted
+				path, message := "/spool/out/read/result.json", "diagnostic"
+				job.ResultPath, job.ErrorMsg = &path, &message
+			case 2:
+				job.Status = db.StatusFailed
+				path, message := "", ""
+				job.ResultPath, job.ErrorMsg = &path, &message
+			}
+			if i == 0 {
+				job.ID = initial
+				// Do not include status here: the real status trigger has already run.
+				_, err = tx.Exec(ctx, `UPDATE sm_jobs SET tool_name=$2, payload=$3,
+					priority=$4, result_path=$5, error_msg=$6, created_at=$7, updated_at=$8
+					WHERE id=$1`, job.ID, job.ToolName, job.Payload, job.Priority,
+					job.ResultPath, job.ErrorMsg, job.CreatedAt, job.UpdatedAt)
+			} else {
+				err = tx.QueryRow(ctx, `INSERT INTO sm_jobs
+					(process_id, tool_name, payload, status, priority, result_path, error_msg, created_at, updated_at)
+					VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+					p.ID, job.ToolName, job.Payload, job.Status, job.Priority,
+					job.ResultPath, job.ErrorMsg, job.CreatedAt, job.UpdatedAt).Scan(&job.ID)
+			}
+			if err != nil {
+				t.Fatalf("prepare read job %d: %v", i, err)
+			}
+			p.Jobs = append(p.Jobs, job)
+		}
+		for i := 0; i < 3; i++ {
+			output := db.OutputDetails{
+				ProcessID: p.ID, ArtifactType: "text",
+				Metadata:  json.RawMessage(`{"nested":{"source":"fixture"},"tags":["a",null,3]}`),
+				CreatedAt: readFixtureTime(),
+			}
+			if i == 0 {
+				output.CreatedAt = output.CreatedAt.Add(time.Minute)
+			}
+			if i == 1 {
+				content := "read artifact"
+				output.Content = &content
+			} else if i == 2 {
+				content := ""
+				output.Content = &content
+			}
+			if err := tx.QueryRow(ctx, `INSERT INTO sm_outputs
+				(process_id, artifact_type, content, metadata, created_at)
+				VALUES ($1,$2,$3,$4,$5) RETURNING id`, p.ID, output.ArtifactType,
+				output.Content, output.Metadata, output.CreatedAt).Scan(&output.ID); err != nil {
+				t.Fatalf("insert read output: %v", err)
+			}
+			p.Outputs = append(p.Outputs, output)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE sm_processes
+			SET state=$2, context=$3, created_at=$4, updated_at=$5 WHERE id=$1`,
+			p.ID, p.State, p.Context, p.CreatedAt, p.UpdatedAt); err != nil {
+			t.Fatalf("set read process fields after status trigger: %v", err)
+		}
+		return p
+	}
+	fixture := readFixture{process: build(count), other: build(2)}
+	for _, apply := range prepare {
+		apply(tx, &fixture)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit read fixture: %v", err)
+	}
+	return fixture
+}
+
+func requireReadJob(t *testing.T, got, want db.JobDetails) {
+	t.Helper()
+	if got.ID != want.ID || got.ProcessID != want.ProcessID ||
+		got.ToolName != want.ToolName || got.Status != want.Status || got.Priority != want.Priority ||
+		!reflect.DeepEqual(got.ResultPath, want.ResultPath) || !reflect.DeepEqual(got.ErrorMsg, want.ErrorMsg) ||
+		!got.CreatedAt.Equal(want.CreatedAt) || !got.UpdatedAt.Equal(want.UpdatedAt) {
+		t.Fatalf("job fields = %+v, want %+v", got, want)
+	}
+	requireJSONEqual(t, got.Payload, want.Payload)
+}
+
+func readJobIDs(jobs []db.JobDetails) []uuid.UUID {
+	ids := make([]uuid.UUID, 0, len(jobs))
+	for _, job := range jobs {
+		ids = append(ids, job.ID)
+	}
+	return ids
+}
+
+func sortedReadJobs(jobs []db.JobDetails, descending bool) []db.JobDetails {
+	result := append([]db.JobDetails{}, jobs...)
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].CreatedAt.Equal(result[j].CreatedAt) {
+			if descending {
+				return result[i].ID.String() > result[j].ID.String()
+			}
+			return result[i].ID.String() < result[j].ID.String()
+		}
+		if descending {
+			return result[i].CreatedAt.After(result[j].CreatedAt)
+		}
+		return result[i].CreatedAt.Before(result[j].CreatedAt)
+	})
+	return result
+}
+
+func requireReadJobs(t *testing.T, got, want []db.JobDetails) {
+	t.Helper()
+	if got == nil {
+		t.Fatal("jobs is nil, want nonnil slice")
+	}
+	if !reflect.DeepEqual(readJobIDs(got), readJobIDs(want)) {
+		t.Fatalf("job IDs = %v, want %v", readJobIDs(got), readJobIDs(want))
+	}
+	for i := range want {
+		requireReadJob(t, got[i], want[i])
+	}
+}
+
+func readOracleIDs(ctx context.Context, t *testing.T, pool *pgxpool.Pool, query string, args ...any) []uuid.UUID {
+	t.Helper()
+	rows, err := pool.Query(ctx, query, args...)
+	if err != nil {
+		t.Fatalf("query independent read oracle: %v", err)
+	}
+	defer rows.Close()
+	ids := make([]uuid.UUID, 0)
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scan read oracle: %v", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate read oracle: %v", err)
+	}
+	return ids
+}
+
+func TestGetProcessDetails(t *testing.T) {
+	env := newQueueTestEnv(t, "step13-"+t.Name()+"-"+uuid.NewString())
+	ctx := queueTestContext(t)
+	f := newReadFixture(ctx, t, env, 7)
+	want := f.process
+	got, err := env.database.GetProcess(ctx, want.ID)
+	if err != nil {
+		t.Fatalf("get process: %v", err)
+	}
+	if got.ID != want.ID || got.InputID != want.InputID || got.State != want.State ||
+		!got.CreatedAt.Equal(want.CreatedAt) || !got.UpdatedAt.Equal(want.UpdatedAt) {
+		t.Fatalf("process fields = %+v, want %+v", got, want)
+	}
+	requireJSONEqual(t, got.Context, want.Context)
+	requireReadJobs(t, got.Jobs, sortedReadJobs(want.Jobs, false))
+	sort.Slice(want.Outputs, func(i, j int) bool {
+		if want.Outputs[i].CreatedAt.Equal(want.Outputs[j].CreatedAt) {
+			return want.Outputs[i].ID.String() < want.Outputs[j].ID.String()
+		}
+		return want.Outputs[i].CreatedAt.Before(want.Outputs[j].CreatedAt)
+	})
+	if len(got.Outputs) != len(want.Outputs) {
+		t.Fatalf("outputs count = %d, want %d (no JOIN duplicates)", len(got.Outputs), len(want.Outputs))
+	}
+	for i, expected := range want.Outputs {
+		actual := got.Outputs[i]
+		if actual.ID != expected.ID || actual.ProcessID != expected.ProcessID ||
+			actual.ArtifactType != expected.ArtifactType || !reflect.DeepEqual(actual.Content, expected.Content) ||
+			!actual.CreatedAt.Equal(expected.CreatedAt) {
+			t.Fatalf("output %d = %+v, want %+v", i, actual, expected)
+		}
+		requireJSONEqual(t, actual.Metadata, expected.Metadata)
+	}
+}
+
+func TestGetProcessNotFound(t *testing.T) {
+	env := newQueueTestEnv(t, "step13-"+t.Name()+"-"+uuid.NewString())
+	got, err := env.database.GetProcess(queueTestContext(t), uuid.New())
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("missing process error = %v, want wrapped pgx.ErrNoRows", err)
+	}
+	if !reflect.DeepEqual(got, db.ProcessDetails{}) {
+		t.Fatalf("missing process returned partial result: %+v", got)
+	}
+}
+
+func TestGetProcessEmptyChildren(t *testing.T) {
+	env := newQueueTestEnv(t, "step13-"+t.Name()+"-"+uuid.NewString())
+	ctx := queueTestContext(t)
+	// Prepare an input/process with no outputs and delete only its own jobs before commit.
+	tx, err := env.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin empty fixture: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	var inputID, processID uuid.UUID
+	if err := tx.QueryRow(ctx, `INSERT INTO sm_inputs(source,payload)
+		VALUES($1,'{"tool":"echo-test"}'::jsonb) RETURNING id`, env.source).Scan(&inputID); err != nil {
+		t.Fatalf("insert empty fixture input: %v", err)
+	}
+	if err := tx.QueryRow(ctx, "SELECT id FROM sm_processes WHERE input_id=$1", inputID).Scan(&processID); err != nil {
+		t.Fatalf("query empty fixture process: %v", err)
+	}
+	if _, err := tx.Exec(ctx, "UPDATE sm_jobs SET status='dispatched' WHERE process_id=$1", processID); err != nil {
+		t.Fatalf("dispatch empty fixture jobs: %v", err)
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM sm_jobs WHERE process_id=$1", processID); err != nil {
+		t.Fatalf("delete own fixture jobs: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit empty fixture: %v", err)
+	}
+	got, err := env.database.GetProcess(ctx, processID)
+	if err != nil {
+		t.Fatalf("get empty process: %v", err)
+	}
+	if got.ID != processID || got.InputID != inputID ||
+		got.Jobs == nil || len(got.Jobs) != 0 || got.Outputs == nil || len(got.Outputs) != 0 {
+		t.Fatalf("empty process = %+v, want existing process with nonnil empty children", got)
+	}
+}
+
+func TestListJobsFilters(t *testing.T) {
+	env := newQueueTestEnv(t, "step13-"+t.Name()+"-"+uuid.NewString())
+	ctx := queueTestContext(t)
+	f := newReadFixture(ctx, t, env, 7)
+	a := f.process.ID
+	missing, nilID := uuid.New(), uuid.Nil
+	dispatched, completed, unknown := db.StatusDispatched, db.StatusCompleted, db.Status("unknown")
+	all := sortedReadJobs(f.process.Jobs, true)
+	selectStatus := func(status db.Status) []db.JobDetails {
+		jobs := make([]db.JobDetails, 0)
+		for _, job := range all {
+			if job.Status == status {
+				jobs = append(jobs, job)
+			}
+		}
+		return jobs
+	}
+	for _, tc := range []struct {
+		name   string
+		filter db.JobFilter
+		want   []db.JobDetails
+	}{
+		{"process A", db.JobFilter{ProcessID: &a}, all},
+		{"A dispatched", db.JobFilter{ProcessID: &a, Status: &dispatched}, selectStatus(dispatched)},
+		{"A completed", db.JobFilter{ProcessID: &a, Status: &completed}, selectStatus(completed)},
+		{"missing process", db.JobFilter{ProcessID: &missing}, nil},
+		{"unknown status", db.JobFilter{ProcessID: &a, Status: &unknown}, nil},
+		{"nil UUID is a filter", db.JobFilter{ProcessID: &nilID}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := env.database.ListJobs(ctx, tc.filter)
+			if err != nil {
+				t.Fatalf("list filtered jobs: %v", err)
+			}
+			requireReadJobs(t, got, tc.want)
+		})
+	}
+	// Exact global IDs come from the verification pool, not assumptions that the
+	// database is empty. Run without app/runner for a stable global snapshot.
+	for _, tc := range []struct {
+		name   string
+		filter db.JobFilter
+		status *db.Status
+	}{
+		{"status only", db.JobFilter{Status: &completed}, &completed},
+		{"empty filter", db.JobFilter{}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wantIDs := readOracleIDs(ctx, t, env.pool, `SELECT id FROM sm_jobs
+				WHERE ($1::text IS NULL OR status=$1::text)
+				ORDER BY created_at DESC,id DESC LIMIT 20`, tc.status)
+			got, err := env.database.ListJobs(ctx, tc.filter)
+			if err != nil {
+				t.Fatalf("list global jobs: %v", err)
+			}
+			if got == nil || len(got) > 20 {
+				t.Fatalf("global jobs count = %d, nil=%v, want nonnil and at most 20", len(got), got == nil)
+			}
+			if !reflect.DeepEqual(readJobIDs(got), wantIDs) {
+				t.Fatalf("global IDs = %v, want %v", readJobIDs(got), wantIDs)
+			}
+			if !reflect.DeepEqual(readJobIDs(got), readJobIDs(sortedReadJobs(got, true))) {
+				t.Fatal("global jobs not ordered by created_at DESC,id DESC")
+			}
+			for _, job := range got {
+				if tc.status != nil && job.Status != *tc.status {
+					t.Fatalf("status-only query returned %q", job.Status)
+				}
+				for _, own := range append(append([]db.JobDetails{}, f.process.Jobs...), f.other.Jobs...) {
+					if own.ID == job.ID {
+						requireReadJob(t, job, own)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestListJobsLimits(t *testing.T) {
+	env := newQueueTestEnv(t, "step13-"+t.Name()+"-"+uuid.NewString())
+	ctx := queueTestContext(t)
+	f := newReadFixture(ctx, t, env, 1, func(tx pgx.Tx, f *readFixture) {
+		// Add 104 tasks in one round trip, before committing the initial task.
+		if _, err := tx.Exec(ctx, `INSERT INTO sm_jobs
+			(process_id,tool_name,payload,status,priority,created_at,updated_at)
+			SELECT $1,'echo-test',jsonb_build_object('index',n),'dispatched',n,
+				$2::timestamptz + n * interval '1 microsecond',$2::timestamptz
+			FROM generate_series(1,104) AS n`, f.process.ID, readFixtureTime()); err != nil {
+			t.Fatalf("batch insert limit fixture: %v", err)
+		}
+	})
+	want := readOracleIDs(ctx, t, env.pool, `SELECT id FROM sm_jobs
+		WHERE process_id=$1 ORDER BY created_at DESC,id DESC`, f.process.ID)
+	if len(want) != 105 {
+		t.Fatalf("limit fixture count = %d, want 105", len(want))
+	}
+	for _, tc := range []struct{ limit, count int }{{-1, 20}, {0, 20}, {1, 1}, {20, 20}, {100, 100}, {101, 100}} {
+		t.Run(strconv.Itoa(tc.limit), func(t *testing.T) {
+			got, err := env.database.ListJobs(ctx, db.JobFilter{ProcessID: &f.process.ID, Limit: tc.limit})
+			if err != nil {
+				t.Fatalf("list limit %d: %v", tc.limit, err)
+			}
+			if got == nil || !reflect.DeepEqual(readJobIDs(got), want[:tc.count]) {
+				t.Fatalf("limit %d IDs = %v, want prefix %v", tc.limit, readJobIDs(got), want[:tc.count])
+			}
+		})
+	}
+}
+
+func TestListJobsKeysetPagination(t *testing.T) {
+	env := newQueueTestEnv(t, "step13-"+t.Name()+"-"+uuid.NewString())
+	ctx := queueTestContext(t)
+	f := newReadFixture(ctx, t, env, 7, func(tx pgx.Tx, f *readFixture) {
+		ids := readJobIDs(f.process.Jobs)
+		sort.Slice(ids, func(i, j int) bool { return ids[i].String() < ids[j].String() })
+		// Generate UUIDs first, then deliberately invert time vs UUID order.
+		// Three tied timestamps cross a size-2 page boundary.
+		for i, offset := range []int{6, 3, 3, 3, 5, 1, 0} {
+			if _, err := tx.Exec(ctx, "UPDATE sm_jobs SET created_at=$2 WHERE id=$1",
+				ids[i], readFixtureTime().Add(time.Duration(offset)*time.Minute)); err != nil {
+				t.Fatalf("set adversarial keyset time: %v", err)
+			}
+		}
+	})
+	completed := db.StatusCompleted
+	for _, tc := range []struct {
+		name   string
+		status *db.Status
+	}{{"all statuses", nil}, {"completed only", &completed}} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := readOracleIDs(ctx, t, env.pool, `SELECT id FROM sm_jobs
+				WHERE process_id=$1 AND ($2::text IS NULL OR status=$2::text)
+				ORDER BY created_at DESC,id DESC`, f.process.ID, tc.status)
+			filter := db.JobFilter{ProcessID: &f.process.ID, Status: tc.status, Limit: 2}
+			gotIDs := make([]uuid.UUID, 0)
+			seen := make(map[uuid.UUID]bool)
+			ended := false
+			for page := 0; page <= len(want)+1; page++ {
+				got, err := env.database.ListJobs(ctx, filter)
+				if err != nil {
+					t.Fatalf("read page %d: %v", page, err)
+				}
+				if got == nil || len(got) > 2 {
+					t.Fatalf("page %d is nil or exceeds limit: %+v", page, got)
+				}
+				if len(got) == 0 {
+					ended = true
+					break
+				}
+				for _, job := range got {
+					if job.ProcessID != f.process.ID || (tc.status != nil && job.Status != *tc.status) {
+						t.Fatalf("page leaked past filter: %+v", job)
+					}
+					if seen[job.ID] {
+						t.Fatalf("duplicate paginated ID %s", job.ID)
+					}
+					seen[job.ID] = true
+					gotIDs = append(gotIDs, job.ID)
+				}
+				lastID := got[len(got)-1].ID
+				filter.CursorID = &lastID
+			}
+			if !ended || !reflect.DeepEqual(gotIDs, want) {
+				t.Fatalf("pagination ended=%v, IDs=%v, want %v", ended, gotIDs, want)
+			}
+			last := want[len(want)-1]
+			filter.CursorID = &last
+			got, err := env.database.ListJobs(ctx, filter)
+			if err != nil || got == nil || len(got) != 0 {
+				t.Fatalf("last cursor page = %+v, err=%v, want nonnil empty", got, err)
+			}
+		})
+	}
+}
+
+func TestListJobsCursorBoundaries(t *testing.T) {
+	env := newQueueTestEnv(t, "step13-"+t.Name()+"-"+uuid.NewString())
+	ctx := queueTestContext(t)
+	f := newReadFixture(ctx, t, env, 7)
+	missing := uuid.New()
+	completed := db.StatusCompleted
+	// This dispatched cursor is older than some completed rows and newer than others.
+	cursor := f.process.Jobs[0].ID
+	if _, err := env.pool.Exec(ctx, "UPDATE sm_jobs SET created_at=$2 WHERE id=$1",
+		cursor, readFixtureTime().Add(90*time.Second)); err != nil {
+		t.Fatalf("prepare status-mismatching cursor: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		cursor uuid.UUID
+		status *db.Status
+	}{
+		{"missing", missing, nil},
+		{"other process", f.other.Jobs[1].ID, nil},
+		{"cursor status differs", cursor, &completed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := readOracleIDs(ctx, t, env.pool, `SELECT j.id FROM sm_jobs j
+				WHERE j.process_id=$1 AND ($2::text IS NULL OR j.status=$2::text)
+				AND (j.created_at,j.id) < (SELECT created_at,id FROM sm_jobs WHERE id=$3)
+				ORDER BY j.created_at DESC,j.id DESC`, f.process.ID, tc.status, tc.cursor)
+			got, err := env.database.ListJobs(ctx, db.JobFilter{
+				ProcessID: &f.process.ID, Status: tc.status, CursorID: &tc.cursor, Limit: 100,
+			})
+			if err != nil {
+				t.Fatalf("list cursor boundary: %v", err)
+			}
+			if got == nil || !reflect.DeepEqual(readJobIDs(got), want) {
+				t.Fatalf("boundary IDs = %v (nil=%v), want %v", readJobIDs(got), got == nil, want)
+			}
+			if tc.name != "missing" && len(want) == 0 {
+				t.Fatal("boundary fixture must include rows below its cursor")
+			}
+			for _, job := range got {
+				if job.ID == tc.cursor || job.ProcessID != f.process.ID {
+					t.Fatalf("cursor included or process filter leaked: %+v", job)
+				}
+			}
+		})
+	}
+}
+
+func TestReadQueriesCanceledContext(t *testing.T) {
+	env := newQueueTestEnv(t, "step13-"+t.Name()+"-"+uuid.NewString())
+	liveCtx := queueTestContext(t)
+	f := newReadFixture(liveCtx, t, env, 7)
+	ctx, cancel := context.WithCancel(liveCtx)
+	cancel()
+	process, err := env.database.GetProcess(ctx, f.process.ID)
+	if !errors.Is(err, context.Canceled) || !reflect.DeepEqual(process, db.ProcessDetails{}) {
+		t.Fatalf("canceled GetProcess = %+v, err=%v, want zero result and wrapped context.Canceled", process, err)
+	}
+	jobs, err := env.database.ListJobs(ctx, db.JobFilter{ProcessID: &f.process.ID})
+	if !errors.Is(err, context.Canceled) || jobs != nil {
+		t.Fatalf("canceled ListJobs = %+v, err=%v, want nil and wrapped context.Canceled", jobs, err)
+	}
+	if err := env.pool.Ping(liveCtx); err != nil {
+		t.Fatalf("database unavailable after cancellation: %v", err)
+	}
+	if _, err := env.database.GetProcess(liveCtx, f.process.ID); err != nil {
+		t.Fatalf("GetProcess unavailable after cancellation: %v", err)
+	}
+	if _, err := env.database.ListJobs(liveCtx, db.JobFilter{ProcessID: &f.process.ID}); err != nil {
+		t.Fatalf("ListJobs unavailable after cancellation: %v", err)
+	}
+}
 
 type queueTestEnv struct {
 	database *db.DB

@@ -37,3 +37,43 @@ type Job struct {
 	OldStatus Status
 	Status    Status
 }
+
+type JobDetails struct {
+	ID         uuid.UUID
+	ProcessID  uuid.UUID
+	ToolName   string
+	Payload    json.RawMessage
+	Status     Status
+	Priority   int
+	ResultPath *string
+	ErrorMsg   *string
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}
+
+type OutputDetails struct {
+	ID           uuid.UUID
+	ProcessID    uuid.UUID
+	ArtifactType string
+	Content      *string
+	Metadata     json.RawMessage
+	CreatedAt    time.Time
+}
+
+type ProcessDetails struct {
+	ID        uuid.UUID
+	InputID   uuid.UUID
+	State     string
+	Context   json.RawMessage
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	Jobs      []JobDetails
+	Outputs   []OutputDetails
+}
+
+type JobFilter struct {
+	ProcessID *uuid.UUID
+	Status    *Status
+	Limit     int
+	CursorID  *uuid.UUID
+}

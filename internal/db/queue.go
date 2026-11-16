@@ -16,7 +16,99 @@ const (
 	createInputQuery     = `SELECT * FROM sm_create_input($1, $2)`
 	pickNextJobQuery     = `SELECT * FROM sm_pick_next_job()`
 	updateJobStatusQuery = `SELECT sm_update_job_status($1, $2, $3, $4)`
+	getProcessQuery      = `SELECT id, input_id, state, context, created_at, updated_at
+		FROM sm_processes WHERE id = $1`
+	getProcessJobsQuery = `SELECT id, process_id, tool_name, payload, status, priority,
+		result_path, error_msg, created_at, updated_at
+		FROM sm_jobs WHERE process_id = $1 ORDER BY created_at ASC, id ASC`
+	getProcessOutputsQuery = `SELECT id, process_id, artifact_type, content, metadata, created_at
+		FROM sm_outputs WHERE process_id = $1 ORDER BY created_at ASC, id ASC`
+	listJobsQuery = `SELECT j.id, j.process_id, j.tool_name, j.payload, j.status, j.priority,
+		j.result_path, j.error_msg, j.created_at, j.updated_at
+		FROM sm_jobs AS j
+		WHERE ($1::uuid IS NULL OR j.process_id = $1::uuid)
+		  AND ($2::text IS NULL OR j.status = $2::text)
+		  AND ($3::uuid IS NULL OR (j.created_at, j.id) < (
+		      SELECT c.created_at, c.id FROM sm_jobs AS c WHERE c.id = $3::uuid
+		  ))
+		ORDER BY j.created_at DESC, j.id DESC LIMIT $4`
 )
+
+func (d *DB) GetProcess(ctx context.Context, processID uuid.UUID) (ProcessDetails, error) {
+	result := ProcessDetails{Jobs: make([]JobDetails, 0), Outputs: make([]OutputDetails, 0)}
+	if err := d.pool.QueryRow(ctx, getProcessQuery, processID).Scan(
+		&result.ID, &result.InputID, &result.State, &result.Context,
+		&result.CreatedAt, &result.UpdatedAt,
+	); err != nil {
+		return ProcessDetails{}, fmt.Errorf("get process %s: %w", processID, err)
+	}
+
+	jobs, err := d.pool.Query(ctx, getProcessJobsQuery, processID)
+	if err != nil {
+		return ProcessDetails{}, fmt.Errorf("get process %s jobs: %w", processID, err)
+	}
+	for jobs.Next() {
+		var job JobDetails
+		if err := jobs.Scan(&job.ID, &job.ProcessID, &job.ToolName, &job.Payload,
+			&job.Status, &job.Priority, &job.ResultPath, &job.ErrorMsg,
+			&job.CreatedAt, &job.UpdatedAt); err != nil {
+			jobs.Close()
+			return ProcessDetails{}, fmt.Errorf("scan process %s job: %w", processID, err)
+		}
+		result.Jobs = append(result.Jobs, job)
+	}
+	err = jobs.Err()
+	jobs.Close()
+	if err != nil {
+		return ProcessDetails{}, fmt.Errorf("iterate process %s jobs: %w", processID, err)
+	}
+
+	outputs, err := d.pool.Query(ctx, getProcessOutputsQuery, processID)
+	if err != nil {
+		return ProcessDetails{}, fmt.Errorf("get process %s outputs: %w", processID, err)
+	}
+	defer outputs.Close()
+	for outputs.Next() {
+		var output OutputDetails
+		if err := outputs.Scan(&output.ID, &output.ProcessID, &output.ArtifactType,
+			&output.Content, &output.Metadata, &output.CreatedAt); err != nil {
+			return ProcessDetails{}, fmt.Errorf("scan process %s output: %w", processID, err)
+		}
+		result.Outputs = append(result.Outputs, output)
+	}
+	if err := outputs.Err(); err != nil {
+		return ProcessDetails{}, fmt.Errorf("iterate process %s outputs: %w", processID, err)
+	}
+	return result, nil
+}
+
+func (d *DB) ListJobs(ctx context.Context, filter JobFilter) ([]JobDetails, error) {
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 20
+	} else if limit > 100 {
+		limit = 100
+	}
+	rows, err := d.pool.Query(ctx, listJobsQuery, filter.ProcessID, filter.Status, filter.CursorID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list jobs: %w", err)
+	}
+	defer rows.Close()
+	jobs := make([]JobDetails, 0)
+	for rows.Next() {
+		var job JobDetails
+		if err := rows.Scan(&job.ID, &job.ProcessID, &job.ToolName, &job.Payload,
+			&job.Status, &job.Priority, &job.ResultPath, &job.ErrorMsg,
+			&job.CreatedAt, &job.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan listed job: %w", err)
+		}
+		jobs = append(jobs, job)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate listed jobs: %w", err)
+	}
+	return jobs, nil
+}
 
 // ErrInvalidCallbackStatus indicates an invalid callback status.
 var ErrInvalidCallbackStatus = errors.New("invalid callback status")

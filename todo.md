@@ -97,7 +97,7 @@
   - Прогнать существующие интеграционные тесты `internal/db/queue_test.go` и `internal/spool/spool_test.go` через `./scripts/quality-gate.sh` без изменения их логики.
   - Сделать git commit: `refactor(db): delegate queue mutations to PostgreSQL functions`
 
-- [ ] **Step 13: Слой чтения статуса процесса и списка задач в `internal/db`**
+- [x] **Step 13: Слой чтения статуса процесса и списка задач в `internal/db`**
   - Добавить в `internal/db/models.go` структуры `ProcessDetails` (данные `sm_processes` + вложенный список его `sm_jobs` и `sm_outputs`) и `JobFilter` (`ProcessID`, `Status`, `Limit`, `CursorID`).
   - Реализовать в `internal/db/queue.go` методы `GetProcess(ctx, processID)` (возврат `pgx.ErrNoRows`, если процесс не найден) и `ListJobs(ctx, filter)` (сортировка `ORDER BY created_at DESC, id DESC` с keyset-пагинацией по `uuidv7()`).
   - Покрыть интеграционными тестами в `internal/db/queue_test.go`.
