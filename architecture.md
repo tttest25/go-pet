@@ -117,7 +117,7 @@ petar — легковесный оркестратор фоновых зада�
 * POST /api/v1/inputs — Ручное/тестовое создание входящего события в sm_inputs.
 * POST /api/v1/jobs/{id}/status — Прием статусов (in_progress, completed, failed) от хостового spool-runner.sh.
 
-## 6. Out of Scope for Phase 1 (Moved to Phase 2)
+## 6. Out of Scope for Phase 1 (ideas for future)
 * Интеграция с Gemini API.
 * HTTP SSE-стриминг для DokuWiki или javascript polling ? websocket ? 
 * Telegram-бот.

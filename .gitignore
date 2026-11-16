@@ -48,3 +48,11 @@ spool/processing/*
 bundle.py
 project_bundle_go_pet.txt
 .opencode/tasks/
+
+# Резервные копии конфигов OpenCode и локальные скрипты бандлинга
+.opencode/*_orig
+bundle.sh
+
+# Резервные копии конфигов OpenCode и локальные скрипты бандлинга
+.opencode/*_orig
+bundle.sh
