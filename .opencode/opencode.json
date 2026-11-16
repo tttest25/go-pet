@@ -131,15 +131,9 @@
   },
 
   "agents": {
-    "title": {
-      "model": "local/gemini-quick-answers"
-    },
-    "summary": {
-      "model": "local/gemini-quick-answers"
-    },
 
-    "plan": {
-      "description": "Архитектор на Google Gemini 4 Hydrogen (20 RPD). Записывает готовое ТЗ за 1-2 запроса.",
+    "architect": {
+      "description": "Архитектор на Google Gemini 4 Hydrogen (20 RPD). Пишет ТЗ в .opencode/tasks/ за 1-2 запроса.",
       "mode": "primary",
       "model": "google/gemini-4-hydrogen",
       "system": "ВНИМАНИЕ: Лимит модели — 20 запросов в день! Инструменты glob и grep отключены. Прочитай целевые файлы по точным путям за один шаг и сразу запиши детальное ТЗ (с точными кусками кода/SQL) в .opencode/tasks/XX_name.md, чтобы его смогла легко реализовать модель Lite-уровня.",
@@ -155,7 +149,7 @@
       ]
     },
 
-    "plan-kimi": {
+    "architect-kimi": {
       "description": "Старший архитектор на Moonshot AI Kimi K3.1 Pro (когда кончились 20 RPD Hydrogen или для сложного SQL)",
       "mode": "primary",
       "model": "kimi-code-plan-global/k3.1-pro",
@@ -222,20 +216,7 @@
         { "action": "edit", "resource": "*", "effect": "deny" },
         { "action": "write", "resource": "*", "effect": "deny" }
       ]
-    },
-
-    "explore": {
-      "description": "Быстрый поиск по кодовой базе за счет пула 500 RPD",
-      "mode": "subagent",
-      "model": "google/gemini-3.1-flash-lite",
-      "permissions": [
-        { "action": "read", "resource": "*", "effect": "allow" },
-        { "action": "glob", "resource": "*", "effect": "allow" },
-        { "action": "grep", "resource": "*", "effect": "allow" },
-        { "action": "edit", "resource": "*", "effect": "deny" },
-        { "action": "write", "resource": "*", "effect": "deny" },
-        { "action": "bash", "resource": "*", "effect": "deny" }
-      ]
     }
+
   }
 }
