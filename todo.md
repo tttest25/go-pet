@@ -91,7 +91,7 @@
   - Проверить идемпотентность миграции и работу функций SQL-тестом в `petar_postgres`.
   - Сделать git commit: `feat(db): add PostgreSQL 18 state machine functions`
 
-- [ ] **Step 12: Перевод `internal/db` на вызов хранимых функций**
+- [x] **Step 12: Перевод `internal/db` на вызов хранимых функций**
   - Обновить `internal/db/queue.go`: заменить сырые SQL-транзакции в `CreateInput`, `PickNextJob` и `UpdateJobStatus` на вызовы `SELECT * FROM sm_create_input(...)`, `SELECT * FROM sm_pick_next_job()`, `SELECT sm_update_job_status(...)`.
   - Сохранить контракты возвращаемых ошибок (включая маппинг отсутствующей/необновляемой задачи в `pgx.ErrNoRows`).
   - Прогнать существующие интеграционные тесты `internal/db/queue_test.go` и `internal/spool/spool_test.go` через `./scripts/quality-gate.sh` без изменения их логики.
