@@ -1,117 +1,964 @@
-# Petar (Оркестратор фоновых задач и обработки знаний)
+# petar — Deployment, Operations Runbook & Testing
 
-**petar** — легковесный, надежный оркестратор фоновых задач и конвейеров обработки данных, спроектированный под жесткие лимиты ресурсов (1 vCPU, 1 GB RAM).
+Легковесный оркестратор для 1 vCPU / 1 GB RAM: PostgreSQL 18 управляет состояниями,
+Go доставляет задания в spool, хостовый Bash runner запускает CLI без Docker-in-Docker.
+Архитектура, модель данных и диаграммы: [architecture.md](architecture.md).
 
-Архитектура построена по принципу **DB-Centric State Machine** (машина состояний внутри PostgreSQL 18) в сочетании с концепцией **Dumb Executor** (Go-сервис и bash-скрипты на хосте выполняют роль легковесных транспортов без тяжелого Docker-in-Docker оверхеда).
+## 1. Deployment
 
----
+### Требования и конфигурация
 
-## 🏗 Архитектура проекта
+Корень проекта — `/opt/go-pet`. Нужны Docker Compose v2, Bash, jq, curl; для
+разработки — Go 1.23+ и C toolchain для `-race`. PostgreSQL 18 поставляется образом
+`pgvector/pgvector:pg18`. Реальная обработка требует установленных `yt-dlp` и `fabric`
+с настроенным провайдером и паттерном `summarize`. В WSL для unit нужен работающий systemd.
 
-### Ключевые компоненты
-1. **PostgreSQL 18 (`pgvector/pgvector:pg18`)**:
-   - Ядро системы и источник правды. Вся логика переходов состояний реализована через таблицы `sm_inputs`, `sm_processes`, `sm_jobs`, `sm_job_logs`, `sm_outputs`, а также триггеры СУБД.
-   - Механизм `LISTEN/NOTIFY` (`смикшером` событий `sm_jobs_channel`) мгновенно уведомляет Go-воркер о появлении новых задач.
-2. **Go-сервис (`cmd/petar`, `internal/...`)**:
-   - **DB / Queue Worker**: Слушает `LISTEN/NOTIFY` (с fallback на `time.Ticker`), захватывает задачи с помощью `SELECT ... FOR UPDATE SKIP LOCKED` и атомарно выгружает их в файловый буфер `/spool/in/`.
-   - **HTTP API Server**: Стандартный `net/http` (Go 1.23+ routing). Предоставляет пробы `/healthz`, `/readyz`, эндпоинт создания инпутов `/api/v1/inputs`, а также колбэки обновления статусов задач `/api/v1/jobs/{id}/status` от хостового ранера.
-   - **Middleware**: Автоматическое добавление/сохранение `X-Request-ID`, извлечение реального IP клиента (`X-Forwarded-For`, `X-Real-IP`, `RemoteAddr`) и структурированное логирование через `log/slog`.
-3. **Хостовый Spool Runner (`scripts/spool-runner.sh`)**:
-   - Демон, обрабатывающий файлы в разделяемой директории `/spool/` (`/spool/in` -> `/spool/processing` -> `/spool/out`), вызывающий утилиты (`yt-dlp`, `fabric`, `echo-test`) и отправляющий HTTP-колбэки в Go-сервис.
+| Go ENV | Локальный default | Compose |
+| --- | --- | --- |
+| `DB_DSN` | `postgres://petar_user:petar_password@127.0.0.1:5432/petar_db?sslmode=disable` | `postgres://petar_user:petar_password@postgres:5432/petar_db?sslmode=disable` |
+| `SPOOL_DIR` | `/opt/go-pet/spool` | `/app/spool` |
+| `HTTP_ADDR` | `127.0.0.1:8080` | `0.0.0.0:8080` |
+| `POLL_INTERVAL` | `45s` (положительная Go duration) | не задан, default `45s` |
 
----
+Compose содержит буквальные ENV: `export DB_DSN=...` на хосте **не** меняет контейнер.
+Менять deployment-конфигурацию нужно оператору явно; этот документ не меняет Compose.
 
-## 📂 Структура директорий
+| Runner ENV / аргумент | Default / смысл |
+| --- | --- |
+| `SPOOL_DIR` | `/opt/go-pet/spool` |
+| `API_BASE_URL` | `http://127.0.0.1:8080/api/v1` |
+| `PATH` | наследуется; должен содержать реальные CLI |
+| `--loop` | проход по `in/*.json`, затем пауза 2 s; без аргумента — один проход |
 
-```text
-/opt/go-pet/
-├── architecture.md               # Архитектурный манифест
-├── rules.md                      # Правила разработки и стандарты кода
-├── todo.md                       # Пошаговый план MVP
-├── cmd/
-│   └── petar/
-│       └── main.go               # Точка входа, DI, Graceful Shutdown
-├── internal/
-│   ├── config/                   # Конфигурация из ENV
-│   ├── db/                       # Пул pgx/v5, LISTEN/NOTIFY, SQL-запросы
-│   ├── spool/                    # Атомарная запись в /spool/in и логика воркера
-│   └── api/                      # HTTP-сервер, роутинг, middleware, хендлеры
-├── postgres/
-│   ├── data/                     # Bind mount БД (в .gitignore)
-│   ├── migrations/               # Миграции базы данных
-│   └── postgresql.conf           # Конфигурация PostgreSQL 18
-├── scripts/
-│   └── spool-runner.sh           # Хостовый скрипт обработки задач из spool
-├── spool/
-│   ├── in/                       # Входящие задачи от воркера Go
-│   ├── processing/               # Задачи в работе у bash-скрипта
-│   └── out/                      # Артефакты выполнения
-├── Dockerfile                    # Multi-stage сборка Go-приложения (Alpine 3.20)
-└── docker-compose.yml            # Оркестрация контейнеров petar_postgres и petar_app
-```
+### Пути, права и границы
 
----
+| Объект | Хост | Контейнер |
+| --- | --- | --- |
+| Spool | `/opt/go-pet/spool/{in,processing,out}` | app: `/app/spool/...`; postgres: `/spool/...` |
+| PG data | `/opt/go-pet/postgres/data` | `/var/lib/postgresql` (не `/data`) |
+| Конфигурация PG | `/opt/go-pet/postgres/postgresql.conf` | `/etc/postgresql/postgresql.conf` |
 
-## 🔄 Текстовая схема взаимодействия (Data & Task Flow)
+Runner передаёт `result_path=/spool/out/<job_id>/result.json`. Это метаданные
+пути, видимого в postgres, **не URL и не путь app**. На хосте читайте
+`/opt/go-pet/spool/out/<job_id>/result.json`. Go пишет задания, но не читает
+артефакты и не предоставляет endpoint скачивания.
 
-```text
- [Клиент / API] 
-       │
-       ▼  POST /api/v1/inputs
-┌──────────────────────────────────────┐
-│ PostgreSQL 18 (sm_inputs / sm_jobs)  │
-│  ├─► Trigger: создает процесс и задачу │
-│  └─► Trigger: pg_notify('sm_jobs')   │
-└──────────────────┬───────────────────┘
-                   │
-                   │ (NOTIFY / Ticker)
-                   ▼
-┌──────────────────────────────────────┐
-│ Go Worker (internal/spool & internal/db)
-│  ├─► SELECT ... FOR UPDATE SKIP LOCKED
-│  └─► Атомарная запись /spool/in/{id}.json
-└──────────────────┬───────────────────┘
-                   │
-                   ▼
-       Shared Volume (/spool/)
-                   │
-                   ▼
-┌──────────────────────────────────────┐
-│ Host Spool Runner (spool-runner.sh)  │
-│  ├─► Сдвигает в /spool/processing/   │
-│  ├─► POST /api/v1/jobs/{id}/status   │  (in_progress)
-│  ├─► Запускает утилиту (yt-dlp/etc.) │
-│  └─► POST /api/v1/jobs/{id}/status   │  (completed / failed)
-└──────────────────────────────────────┘
-```
-
----
-
-## 🚀 Инструкция по сборке и запуск
-
-### Требования
-- Docker & Docker Compose (v2+)
-- Go 1.23+ (для локальной разработки и тестирования)
-
-### Запуск полного стека через Docker Compose
-Для сборки и запуска всей системы (PostgreSQL 18 + Go приложение с healthcheck и пробросом volumes) выполните:
+App работает с UID 1000, writer создаёт файлы с mode `0600`. Поэтому готовый
+вариант ниже требует хостового пользователя с **тем же UID 1000**:
+одних групп/default ACL недостаточно для чтения новых файлов с mode `0600`.
+Runner должен читать файлы app, перемещать их между каталогами и писать `out`.
+Проверьте текущую учётную запись; если UID другой, остановитесь и согласуйте
+deployment-права/пользователя отдельно, не запускайте runner от root.
 
 ```bash
+set -euo pipefail
+cd /opt/go-pet
+test "$(id -u)" -eq 1000
+RUNNER_USER="$(id -un)"
+sudo mkdir -p spool/{in,processing,out}
+# Только каталоги spool, не postgres/data и не всё дерево проекта.
+sudo chown "$RUNNER_USER:$(id -gn)" spool spool/{in,processing,out}
+sudo chmod u+rwx spool spool/{in,processing,out}
+test -r scripts/spool-runner.sh
+for d in spool spool/in spool/processing spool/out; do test -w "$d" && test -x "$d"; done
+```
+
+Проверьте также право прохода по `/opt/go-pet` для UID 1000. Не используйте
+`chmod 777`; существующие файлы должны принадлежать UID 1000, проверяйте их отдельно.
+
+### PostgreSQL и bootstrap миграций
+
+Compose services: `postgres`, `app`; контейнеры: `petar_postgres`, `petar_app`.
+Роль / БД / пароль: `petar_user` / `petar_db` / `petar_password`.
+Порты опубликованы только на loopback: `127.0.0.1:5432`, `127.0.0.1:8080`.
+Сеть: `petar_shared_net` (ключ Compose `petar_net`).
+Пароль примера не подходит для публичного production; API не имеет встроенной авторизации.
+
+**Сначала проверьте схему.** Mount `postgres/migrations` в
+`/docker-entrypoint-initdb.d` содержит и `.up.sql`, и `.down.sql`.
+Entrypoint выполняет SQL по имени, не понимая up/down: на пустом data dir down
+предшествует соответствующему up. Это не migration manager и не гарантия готовой
+схемы после одного `up`. На существующем data dir initdb повторно не запускается.
+Никогда не удаляйте `postgres/data` ради повторного bootstrap.
+
+```bash
+cd /opt/go-pet
+docker compose up -d postgres
+docker logs petar_postgres
+docker exec petar_postgres pg_isready -U petar_user -d petar_db
+docker exec -i petar_postgres psql -U petar_user -d petar_db -v ON_ERROR_STOP=1 <<'SQL'
+SELECT extname FROM pg_extension ORDER BY extname;
+SELECT srvname FROM pg_foreign_server;
+SELECT to_regclass('sm_inputs'), to_regclass('sm_processes'), to_regclass('sm_jobs'),
+       to_regclass('sm_job_logs'), to_regclass('sm_outputs');
+SELECT to_regprocedure('sm_create_input(text,jsonb)'),
+       to_regprocedure('sm_pick_next_job()'),
+       to_regprocedure('sm_update_job_status(uuid,text,text,text)');
+SQL
+```
+
+Существующая БД: при наличии объектов не повторять `000002` — она не идемпотентна.
+Пустое окружение: после завершения initdb проверьте результаты выше и логи.
+Следующая функция позволяет **явно** применить только недостающие up-файлы
+в порядке 000001 → 000002 → 000003; выполняйте соответствующие вызовы лишь
+после проверки, не все автоматически:
+
+```bash
+cd /opt/go-pet
+apply_up() {
+  docker exec -i petar_postgres psql -U petar_user -d petar_db \
+    -v ON_ERROR_STOP=1 < "/opt/go-pet/postgres/migrations/$1"
+}
+# Если отсутствуют расширения vector/file_fdw/pg_trgm или сервер dokuwiki_files:
+# apply_up 000001_init_extensions.up.sql
+# Если отсутствуют ВСЕ пять sm-таблиц:
+# apply_up 000002_create_state_machine.up.sql
+# Если отсутствуют хранимые функции:
+# apply_up 000003_db_state_functions.up.sql
+```
+
+`000001` использует IF NOT EXISTS, `000003` — CREATE OR REPLACE.
+При частично созданной схеме, ошибках initdb или несовместимых объектах
+**остановитесь и разберите несоответствие**, не запускайте down/повторный `000002`
+на рабочей БД. После применения повторите проверку объектов.
+В `postgresql.conf` для WSL стоит `io_method='worker'`.
+
+### Старт приложения
+
+Только после проверки схемы:
+
+```bash
+cd /opt/go-pet
 docker compose up -d --build
+docker compose ps
+curl -fsS http://127.0.0.1:8080/healthz
+curl -fsS http://127.0.0.1:8080/readyz
+docker logs --tail 100 petar_app
 ```
 
-### Проверка работоспособности
-1. Проверка liveness пробы:
-   ```bash
-   curl -i http://127.0.0.1:8080/healthz
-   ```
-2. Проверка готовности (подключение к БД):
-   ```bash
-   curl -i http://127.0.0.1:8080/readyz
-   ```
+Compose уже содержит `build.network: host`. При прямой сборке:
 
-### Локальное тестирование
-Для запуска всех тестов с детектером гонок (`-race`):
 ```bash
-go test -v -race ./...
+docker build --network host -t petar:local .
 ```
+
+В WSL не чините DNS внутри build-контейнера, не перебирайте Alpine mirrors
+и не создавайте vendor ради обхода сети.
+
+### Хостовый runner через systemd
+
+Unit создаёт **оператор**, не приложение. Пример использует текущего
+непривилегированного пользователя, а не вымышленную учётную запись `petar`.
+Сначала настройте права из раздела выше, HOME, CLI и конфигурацию fabric.
+Команды рассчитаны на обычные имена/пути без пробелов и кавычек.
+
+```bash
+set -euo pipefail
+test "$(id -u)" -eq 1000
+RUNNER_USER="$(id -un)"
+RUNNER_HOME="$(getent passwd "$RUNNER_USER" | cut -d: -f6)"
+RUNNER_PATH="$RUNNER_HOME/.local/bin:$RUNNER_HOME/go/bin:/usr/local/bin:/usr/bin:/bin"
+env HOME="$RUNNER_HOME" PATH="$RUNNER_PATH" bash -c 'command -v jq curl; command -v yt-dlp fabric'
+sudo tee /etc/systemd/system/petar-spool-runner.service >/dev/null <<EOF
+[Unit]
+Description=petar host spool runner
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$RUNNER_USER
+WorkingDirectory=/opt/go-pet
+Environment="HOME=$RUNNER_HOME"
+Environment="PATH=$RUNNER_PATH"
+Environment=SPOOL_DIR=/opt/go-pet/spool
+Environment=API_BASE_URL=http://127.0.0.1:8080/api/v1
+ExecStart=/usr/bin/bash /opt/go-pet/scripts/spool-runner.sh --loop
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+curl -fsS http://127.0.0.1:8080/readyz
+sudo systemctl daemon-reload
+sudo systemctl enable --now petar-spool-runner.service
+sudo systemctl status petar-spool-runner.service --no-pager
+sudo journalctl -u petar-spool-runner.service -f
+```
+
+`After=` задаёт порядок, не готовность API. Без доступного API задача может
+остаться в `processing`. Runner сканирует только `in/*.json`, сам не возобновляет
+`processing/*.json`. Без установленных CLI yt-dlp/fabric создают simulated success!
+
+```bash
+sudo systemctl stop petar-spool-runner.service
+find /opt/go-pet/spool/processing -maxdepth 1 -type f -name '*.json' -print
+# Для оставшихся файлов сначала выполните диагностику/recovery из раздела 4.
+sudo systemctl start petar-spool-runner.service
+```
+
+### Внешний DokuWiki BFF и reverse proxy
+
+DokuWiki BFF — **серверный клиент** API; браузер обращается к BFF, а не напрямую
+к petar. Исходники/конфигурация плагина здесь не поставляются: upstream URL
+настраивается средствами конкретного плагина. PHP actions, имена его параметров,
+CORS и auth middleware здесь не определяются.
+
+Ниже три **альтернативных**, независимых варианта. Домен `petar.example.test`
+и entrypoint `web` — параметры примера, не текущая конфигурация репозитория.
+Не публикуйте незащищённый API в интернет: ограничьте доступ доверенным BFF/сетям,
+организуйте TLS и авторизацию на внешнем периметре. Пробы не входят в API-router.
+Ни один вариант не использует StripPrefix: `/api/v1` должен сохраниться ровно один раз.
+
+#### Вариант A: Traefik Docker provider
+
+После создания сети основным Compose оператор размещает, например,
+`/opt/go-pet/compose.proxy.yml` (добавление к основному Compose):
+
+```yaml
+services:
+  app:
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: petar_shared_net
+      traefik.http.routers.petar.rule: "Host(`petar.example.test`) && PathPrefix(`/api/v1`)"
+      traefik.http.routers.petar.entrypoints: web
+      traefik.http.routers.petar.service: petar-api
+      traefik.http.services.petar-api.loadbalancer.server.port: "8080"
+```
+
+Отдельный пример `/opt/go-pet/traefik-docker.compose.yml` для внешнего proxy:
+
+```yaml
+services:
+  traefik:
+    image: traefik:v3
+    command:
+      - --entrypoints.web.address=:80
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+    ports:
+      - "127.0.0.1:8081:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [shared]
+networks:
+  shared:
+    external: true
+    name: petar_shared_net
+```
+
+Docker socket даёт чувствительный доступ к Docker API даже при mount `ro`;
+для production используйте защищённый socket proxy. Запуск оператором:
+
+```bash
+cd /opt/go-pet
+docker compose -f docker-compose.yml -f compose.proxy.yml up -d app
+docker compose -p petar-proxy -f traefik-docker.compose.yml up -d
+```
+
+#### Вариант B: Traefik file provider
+
+Оператор размещает static `/opt/go-pet/traefik/traefik.yml`:
+
+```yaml
+entryPoints:
+  web:
+    address: ":80"
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true
+```
+
+И dynamic `/opt/go-pet/traefik/dynamic.yml`:
+
+```yaml
+http:
+  routers:
+    petar:
+      rule: "Host(`petar.example.test`) && PathPrefix(`/api/v1`)"
+      entryPoints: [web]
+      service: petar-api
+  services:
+    petar-api:
+      loadBalancer:
+        servers:
+          - url: "http://petar_app:8080"
+```
+
+Самостоятельный `/opt/go-pet/traefik-file.compose.yml`:
+
+```yaml
+services:
+  traefik:
+    image: traefik:v3
+    ports:
+      - "127.0.0.1:8081:80"
+    volumes:
+      - /opt/go-pet/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - /opt/go-pet/traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+    networks: [shared]
+networks:
+  shared:
+    external: true
+    name: petar_shared_net
+```
+
+```bash
+docker compose -p petar-proxy-file -f /opt/go-pet/traefik-file.compose.yml up -d
+```
+
+Для Traefik **на хосте** вместо контейнерного backend используйте
+`http://127.0.0.1:8080`, а `providers.file.filename` замените на реальный host path
+`/opt/go-pet/traefik/dynamic.yml`. Выберите свободный listen port (например `:8081`).
+Для Traefik в контейнере localhost обозначает сам Traefik, а не app.
+
+#### Вариант C: Nginx на хосте
+
+Оператор помещает `/etc/nginx/conf.d/petar.conf` в контекст `http`:
+
+```nginx
+server {
+    listen 127.0.0.1:8081;
+    server_name petar.example.test;
+    client_max_body_size 1m;
+
+    location /api/v1/ {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Request-ID $http_x_request_id;
+        proxy_pass_header X-Request-ID;
+    }
+}
+```
+
+`proxy_pass` без URI сохраняет путь и query; метод и тело передаются по умолчанию.
+В контейнерном Nginx, подключённом к `petar_shared_net`, backend должен быть
+`http://petar_app:8080`, не localhost. Ответ `X-Request-ID` не скрывается.
+
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+#### Проверка BFF upstream через выбранный proxy
+
+BFF на хосте может использовать base `http://petar.example.test:8081/api/v1`
+при разрешении домена в loopback. BFF в контейнере должен иметь сетевой доступ
+к proxy (например `http://traefik:80/api/v1` в общей сети с корректным Host);
+его `127.0.0.1` не является хостом. Настройка Host/upstream зависит от плагина.
+Проверка с хоста (для любого из примеров на 8081):
+
+```bash
+PROXY_URL=http://127.0.0.1:8081/api/v1
+RESPONSE="$(curl -fsS -H 'Host: petar.example.test' -H 'X-Request-ID: proxy-check' \
+  -H 'Content-Type: application/json' -d '{"source":"manual","payload":{"tool":"echo-test","message":"proxy"}}' \
+  "$PROXY_URL/inputs")"
+PROCESS_ID="$(jq -er .process_id <<<"$RESPONSE")"
+curl -fsS -D - -H 'Host: petar.example.test' "$PROXY_URL/processes/$PROCESS_ID"
+curl -fsS --get -H 'Host: petar.example.test' \
+  --data-urlencode "process_id=$PROCESS_ID" --data-urlencode 'limit=20' "$PROXY_URL/jobs"
+```
+
+## 2. HTTP API и наблюдаемость
+
+| Метод и путь | Успех | Ошибки обработчика |
+| --- | --- | --- |
+| `GET /healthz` | 200 `{"status":"ok"}` | — |
+| `GET /readyz` | 200 `{"status":"ready"}` | 503 |
+| `POST /api/v1/inputs` | 201 | 400, 500 |
+| `POST /api/v1/jobs/{id}/status` | 204 без тела | 400, 404, 500 |
+| `GET /api/v1/processes/{id}` | 200 объект | 400, 404, 500 |
+| `GET /api/v1/jobs` | 200 массив | 400, 500 |
+
+POST принимает ровно один JSON-документ до 1 MiB, неизвестные поля верхнего
+уровня отклоняются. Source должен быть непустым после trim; payload — объект
+с tool `echo-test`, `yt-dlp` или `fabric`. Дополнительные поля payload допускаются.
+Используйте точное написание tool без пробелов: проверка API не переписывает payload.
+Ошибки обработчиков имеют `{"error":"..."}`; стандартные ответы ServeMux
+(например 405) не обязаны иметь такой JSON.
+
+Пример input и ответа (ID ниже иллюстративные):
+
+```json
+{"source":"manual","payload":{"tool":"echo-test","message":"hello"}}
+```
+
+```json
+{
+  "input_id": "01900000-0000-7000-8000-000000000001",
+  "process_id": "01900000-0000-7000-8000-000000000002",
+  "status": "new",
+  "id": "01900000-0000-7000-8000-000000000001"
+}
+```
+
+Legacy `id=input_id`, это **не job ID**. Input остаётся `new` и после
+завершения процесса: автоматический перевод в `processed/error` не реализован.
+Callback разрешён только для исходных `dispatched/in_progress`:
+`in_progress`, `completed` с непустым `result_path`, `failed` с непустым `error_msg`.
+`pending` через HTTP не принимается. Отсутствующая/необновляемая задача — 404;
+повтор terminal callback тоже 404. Повтор `in_progress` допустим, но аудит
+добавляется только при изменении статуса.
+
+```json
+{"status":"in_progress"}
+```
+
+```json
+{"status":"completed","result_path":"/spool/out/01900000-0000-7000-8000-000000000003/result.json"}
+```
+
+```json
+{"status":"failed","error_msg":"tool exited with code 1"}
+```
+
+GET process возвращает поля:
+
+- Процесс: `id,input_id,state,context,created_at,updated_at,jobs,outputs`.
+- Job: `id,process_id,tool_name,payload,status,priority,result_path,error_msg,created_at,updated_at`.
+- Output: `id,process_id,artifact_type,content,metadata,created_at`.
+- Nullable строки — `null`, пустые коллекции — `[]`, JSONB — вложенный JSON,
+  времена — JSON-сериализация Go `time.Time` (RFC3339 с дробной частью при наличии).
+- Jobs и outputs внутри процесса упорядочены `created_at ASC,id ASC`.
+- Успешное завершение через функцию создаёт output `artifact_type="result"`,
+  `content=null`, `metadata={"result_path":"/spool/out/.../result.json"}`.
+
+Пример завершённого процесса:
+
+```json
+{
+  "id": "01900000-0000-7000-8000-000000000002",
+  "input_id": "01900000-0000-7000-8000-000000000001",
+  "state": "completed",
+  "context": {},
+  "created_at": "2026-11-16T10:00:00Z",
+  "updated_at": "2026-11-16T10:00:02Z",
+  "jobs": [{
+    "id": "01900000-0000-7000-8000-000000000003",
+    "process_id": "01900000-0000-7000-8000-000000000002",
+    "tool_name": "echo-test",
+    "payload": {"tool":"echo-test","message":"hello"},
+    "status": "completed",
+    "priority": 0,
+    "result_path": "/spool/out/01900000-0000-7000-8000-000000000003/result.json",
+    "error_msg": null,
+    "created_at": "2026-11-16T10:00:00Z",
+    "updated_at": "2026-11-16T10:00:02Z"
+  }],
+  "outputs": [{
+    "id": "01900000-0000-7000-8000-000000000004",
+    "process_id": "01900000-0000-7000-8000-000000000002",
+    "artifact_type": "result",
+    "content": null,
+    "metadata": {"result_path":"/spool/out/01900000-0000-7000-8000-000000000003/result.json"},
+    "created_at": "2026-11-16T10:00:02Z"
+  }]
+}
+```
+
+GET jobs — массив таких job-объектов **без обёртки**, total или next_cursor.
+Фильтры: `process_id`, `status`, `limit`, `cursor`. Статусы:
+`pending,dispatched,in_progress,completed,failed`. Limit default 20, положительное
+целое, сверху ограничен 100. Пустые/повторные известные параметры, неверные UUID,
+status, limit и malformed query дают 400. Неизвестные имена игнорируются, если
+query синтаксически корректен. Порядок `created_at DESC,id DESC`; cursor — ID
+существующей задачи, граница по паре `(created_at,id)`, не только UUID.
+Следующая страница использует последний ID предыдущей и те же фильтры.
+Несуществующий cursor даёт `[]`, не 404.
+
+Middleware сохраняет входящий `X-Request-ID` либо создаёт UUID и возвращает его
+в заголовке. JSON slog в stdout: `request_id`, `client_ip`, `method`, `path`,
+`status`, `latency_ms`, `response_size`. IP: первый X-Forwarded-For, затем
+X-Real-IP, затем RemoteAddr. Trusted-proxy validation нет: периметр должен
+контролировать подставляемые заголовки. Request ID не сохраняется в БД/spool
+и автоматически не связывает callbacks с исходным POST.
+
+## 3. Operations: ручной E2E
+
+### Echo-test, GET и пагинация
+
+Все следующие блоки — Bash. Нужны работающие app и runner (systemd или отдельный
+`bash scripts/spool-runner.sh --loop`, но не оба одновременно).
+Выполняйте сценарий в одной Bash-сессии с `set -euo pipefail`.
+
+```bash
+set -euo pipefail
+cd /opt/go-pet
+API_BASE_URL=http://127.0.0.1:8080/api/v1
+MESSAGE='hello from operator'
+REQUEST_ID="manual-$(date +%s)"
+HEADERS="$(mktemp "${TMPDIR:-/tmp}/petar-headers.XXXXXX")"
+RESPONSE="$(jq -n --arg text "$MESSAGE" \
+  '{source:"manual",payload:{tool:"echo-test",message:$text}}' |
+  curl -fsS -D "$HEADERS" -H "X-Request-ID: $REQUEST_ID" \
+    -H 'Content-Type: application/json' --data-binary @- "$API_BASE_URL/inputs")"
+jq . <<<"$RESPONSE"
+PROCESS_ID="$(jq -er .process_id <<<"$RESPONSE")"
+grep -i '^X-Request-ID:' "$HEADERS"
+rm "$HEADERS"
+docker logs --since 5m petar_app 2>&1 | grep -F "$REQUEST_ID"
+curl -fsS "$API_BASE_URL/processes/$PROCESS_ID" | jq .
+
+# Общая ограниченная функция ожидания; return 1=failed, 2=timeout.
+wait_process() {
+  local pid="$1" snapshot state n
+  for ((n=0; n<120; n++)); do
+    snapshot="$(curl -fsS --max-time 5 "$API_BASE_URL/processes/$pid")" || return 3
+    state="$(jq -er .state <<<"$snapshot")" || return 3
+    case "$state" in
+      completed) printf '%s\n' "$snapshot"; return 0 ;;
+      failed) printf '%s\n' "$snapshot" >&2; echo 'process failed' >&2; return 1 ;;
+    esac
+    sleep 1
+  done
+  echo "timeout waiting for $pid" >&2
+  return 2
+}
+DETAILS="$(wait_process "$PROCESS_ID")"
+JOB_ID="$(jq -er '.jobs[0].id' <<<"$DETAILS")"
+cat "/opt/go-pet/spool/out/$JOB_ID/result.json"
+jq -e --arg path "/spool/out/$JOB_ID/result.json" \
+  '.outputs | any(.artifact_type=="result" and .content==null and .metadata.result_path==$path)' \
+  <<<"$DETAILS"
+
+PAGE="$(curl -fsS --get "$API_BASE_URL/jobs" \
+  --data-urlencode "process_id=$PROCESS_ID" --data-urlencode 'status=completed' \
+  --data-urlencode 'limit=20')"
+jq . <<<"$PAGE"
+CURSOR="$(jq -r 'last.id // empty' <<<"$PAGE")"
+if [[ -n "$CURSOR" ]]; then
+  curl -fsS --get "$API_BASE_URL/jobs" \
+    --data-urlencode "process_id=$PROCESS_ID" --data-urlencode 'status=completed' \
+    --data-urlencode 'limit=20' --data-urlencode "cursor=$CURSOR" | jq .
+fi
+```
+
+После получения `JOB_ID` выполните аудит из раздела 4. Ожидаются переходы
+pending → dispatched → in_progress → completed; записи об исходном INSERT
+pending в `sm_job_logs` нет.
+
+### Реальный yt-dlp + fabric: два input, два процесса
+
+Это **операторская передача данных**, не автоматический pipeline/DAG.
+`yt-dlp --dump-json` возвращает метаданные, не скачивает аудио и не транскрибирует.
+Предварительно выполните `command -v yt-dlp fabric` с HOME/PATH пользователя unit
+и настройте провайдера/pattern fabric в его HOME. Проверьте unit через
+`systemctl cat petar-spool-runner.service`; окружение интерактивного shell
+может отличаться. Пример проверки для пользователя текущего unit:
+
+```bash
+RUNNER_USER="$(systemctl show -p User --value petar-spool-runner.service)"
+RUNNER_HOME="$(getent passwd "$RUNNER_USER" | cut -d: -f6)"
+RUNNER_PATH="$RUNNER_HOME/.local/bin:$RUNNER_HOME/go/bin:/usr/local/bin:/usr/bin:/bin"
+sudo -u "$RUNNER_USER" env HOME="$RUNNER_HOME" PATH="$RUNNER_PATH" \
+  bash -c 'command -v yt-dlp && command -v fabric'
+```
+
+Следующий блок использует `API_BASE_URL` и `wait_process` из echo-примера;
+ожидание ограничено 120 итерациями (пауза 1 s, каждый HTTP-запрос до 5 s).
+Для длинных CLI увеличьте число итераций осознанно.
+
+```bash
+read -r -p 'URL одного видео (не playlist): ' VIDEO_URL
+test -n "$VIDEO_URL"
+YTDLP_RESPONSE="$(jq -n --arg url "$VIDEO_URL" \
+  '{source:"manual",payload:{tool:"yt-dlp",url:$url}}' |
+  curl -fsS -H 'Content-Type: application/json' --data-binary @- "$API_BASE_URL/inputs")"
+YTDLP_PROCESS="$(jq -er .process_id <<<"$YTDLP_RESPONSE")"
+YTDLP_DETAILS="$(wait_process "$YTDLP_PROCESS")"
+YTDLP_JOB="$(jq -er '.jobs[0].id' <<<"$YTDLP_DETAILS")"
+META="/opt/go-pet/spool/out/$YTDLP_JOB/result.json"
+jq . "$META"
+if jq -s -e 'any(.[]; (.warning // "" | contains("simulated")))' "$META"; then
+  echo 'Simulated yt-dlp: установите CLI в окружении runner' >&2
+  exit 1
+fi
+# Только доступные title/description, НЕ транскрипт. Максимум 16k символов.
+TEXT="$(jq -sr 'map([.title // "", .description // ""] | join("\n")) | join("\n") | .[0:16000]' "$META")"
+test -n "$TEXT"
+FABRIC_BODY="$(jq -n --arg text "$TEXT" \
+  '{source:"manual",payload:{tool:"fabric",pattern:"summarize",text:$text}}')"
+test "$(printf '%s' "$FABRIC_BODY" | wc -c)" -lt 1048576
+FABRIC_RESPONSE="$(curl -fsS -H 'Content-Type: application/json' \
+  --data-binary "$FABRIC_BODY" "$API_BASE_URL/inputs")"
+FABRIC_PROCESS="$(jq -er .process_id <<<"$FABRIC_RESPONSE")"
+FABRIC_DETAILS="$(wait_process "$FABRIC_PROCESS")"
+FABRIC_JOB="$(jq -er '.jobs[0].id' <<<"$FABRIC_DETAILS")"
+RESULT="/opt/go-pet/spool/out/$FABRIC_JOB/result.json"
+jq . "$RESULT"
+if jq -e '.warning // "" | contains("simulated")' "$RESULT"; then
+  echo 'Simulated fabric: проверьте CLI/PATH' >&2
+  exit 1
+fi
+cat "/opt/go-pet/spool/out/$FABRIC_JOB/output.md"
+```
+
+При отсутствующем CLI runner может успешно завершить simulated-задачу;
+для fabric тогда `output.md` не создаётся. Реальный fabric читает `payload.text`,
+запускается с `--pattern payload.pattern`, пишет `output.md` и `result.json`
+(в последнем `output_path` — host path runner).
+
+## 4. Operations: аудит и recovery
+
+### Диагностика
+
+```bash
+docker logs --tail 100 petar_app
+docker logs --tail 100 petar_postgres
+sudo journalctl -u petar-spool-runner.service --since '15 minutes ago' --no-pager
+find /opt/go-pet/spool/{in,processing,out} -maxdepth 2 -type f -print
+# JOB_ID и PROCESS_ID получены из API, не путать с input_id.
+docker exec -i petar_postgres psql -U petar_user -d petar_db \
+  -v ON_ERROR_STOP=1 -v job_id="$JOB_ID" -v process_id="$PROCESS_ID" <<'SQL'
+SELECT * FROM sm_jobs WHERE id = :'job_id'::uuid;
+SELECT * FROM sm_processes WHERE id = :'process_id'::uuid;
+SELECT id,job_id,old_status,new_status,message,created_at
+FROM sm_job_logs WHERE job_id = :'job_id'::uuid ORDER BY created_at,id;
+SELECT l.id,l.job_id,l.old_status,l.new_status,l.message,l.created_at
+FROM sm_job_logs l JOIN sm_jobs j ON j.id=l.job_id
+WHERE j.process_id=:'process_id'::uuid ORDER BY l.created_at,l.id;
+SQL
+```
+
+### Зависшие dispatched/in_progress
+
+Захват БД и публикация файла — не общая транзакция. Сбой после dispatch может
+оставить задачу без файла; сбой callback — с файлом/артефактом и старым статусом.
+Exactly-once, lease, автоматического retry и идемпотентности CLI нет.
+15 минут ниже — эвристика оператора, не встроенный timeout.
+
+```bash
+docker exec -i petar_postgres psql -U petar_user -d petar_db -v ON_ERROR_STOP=1 <<'SQL'
+SELECT id,process_id,status,updated_at,result_path,error_msg
+FROM sm_jobs
+WHERE status IN ('dispatched','in_progress') AND updated_at < NOW()-INTERVAL '15 minutes'
+ORDER BY updated_at;
+SQL
+```
+
+1. Выберите **один** job. Остановите runner и app; проверьте отсутствие других
+   runner/локальных Go-сервисов/активных CLI, включая запущенные вручную.
+   Остановка unit может прервать CLI; убедитесь, что внешняя операция действительно
+   прекращена. Сохраните исходные записи/артефакты.
+2. Архивируйте только файлы выбранного ID, уберите их из активных in/processing.
+   **Не** переносите processing обратно в in одновременно с DB requeue.
+3. Выберите ровно один SQL-вариант: requeue либо failed. Просмотрите запись
+   непосредственно перед операцией.
+4. Проверьте audit/process, запустите app, дождитесь readyz, затем runner.
+
+```bash
+set -euo pipefail
+read -r -p 'Job UUID для recovery: ' JOB_ID
+[[ "$JOB_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+JOB_ID="${JOB_ID,,}"
+sudo systemctl stop petar-spool-runner.service
+docker stop petar_app
+pgrep -af 'spool-runner|yt-dlp|fabric|petar' || true
+# ПРОВЕРКА ОПЕРАТОРА: других исполнителей/CLI нет; только после неё продолжать.
+ARCHIVE="/opt/go-pet/spool/recovery/$JOB_ID-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$ARCHIVE"/{in,processing}
+docker exec -i petar_postgres psql -U petar_user -d petar_db \
+  -v ON_ERROR_STOP=1 -v job_id="$JOB_ID" > "$ARCHIVE/db-before.txt" <<'SQL'
+SELECT * FROM sm_jobs WHERE id=:'job_id'::uuid;
+SELECT p.* FROM sm_processes p JOIN sm_jobs j ON j.process_id=p.id WHERE j.id=:'job_id'::uuid;
+SELECT * FROM sm_job_logs WHERE job_id=:'job_id'::uuid ORDER BY created_at,id;
+SELECT o.* FROM sm_outputs o JOIN sm_jobs j ON j.process_id=o.process_id WHERE j.id=:'job_id'::uuid;
+SQL
+for stage in in processing; do
+  for ext in json tmp; do
+    f="/opt/go-pet/spool/$stage/$JOB_ID.$ext"
+    if [[ -f "$f" ]]; then mv -- "$f" "$ARCHIVE/$stage/"; fi
+  done
+done
+if [[ -d "/opt/go-pet/spool/out/$JOB_ID" ]]; then
+  cp -a "/opt/go-pet/spool/out/$JOB_ID" "$ARCHIVE/out"
+fi
+cat "$ARCHIVE/db-before.txt"
+```
+
+**Вариант A — административный возврат в pending:**
+
+```bash
+docker exec -i petar_postgres psql -U petar_user -d petar_db \
+  -v ON_ERROR_STOP=1 -v job_id="$JOB_ID" <<'SQL'
+BEGIN;
+UPDATE sm_jobs
+SET status = 'pending', result_path = NULL, error_msg = NULL,
+    updated_at = NOW()
+WHERE id = :'job_id'::uuid
+  AND status IN ('dispatched', 'in_progress')
+RETURNING id, OLD.status AS old_status, NEW.status AS new_status;
+COMMIT;
+SQL
+```
+
+Это административный обход callback-функции: триггеры запишут аудит,
+переведут процесс в init и опубликуют NOTIFY после commit. App также выгружает
+pending на старте. UPDATE 0 означает отсутствие ID или уже иной статус:
+проверить запись, не расширять WHERE. CLI может выполниться повторно, артефакты
+могут перезаписаться; копия сохранена в recovery.
+
+**Вариант B — завершить ошибкой через функцию (не выполнять после A):**
+
+```bash
+docker exec -i petar_postgres psql -U petar_user -d petar_db \
+  -v ON_ERROR_STOP=1 -v job_id="$JOB_ID" <<'SQL'
+SELECT sm_update_job_status(
+    :'job_id'::uuid, 'failed', NULL, 'manual recovery: abandoned job'
+);
+SQL
+```
+
+Функция принимает только dispatched/in_progress; при конкурентной смене
+статуса выдаст ошибку. Не выполняйте массовый UPDATE незавершённых задач.
+Прямой UPDATE в completed **не** эквивалентен функции: он не создаёт sm_outputs.
+
+После любого одного варианта:
+
+```bash
+docker exec -i petar_postgres psql -U petar_user -d petar_db \
+  -v ON_ERROR_STOP=1 -v job_id="$JOB_ID" <<'SQL'
+SELECT j.id,j.status,p.state FROM sm_jobs j JOIN sm_processes p ON p.id=j.process_id
+WHERE j.id=:'job_id'::uuid;
+SELECT id,job_id,old_status,new_status,message,created_at
+FROM sm_job_logs WHERE job_id=:'job_id'::uuid ORDER BY created_at,id;
+SQL
+docker start petar_app
+for ((n=0; n<30; n++)); do
+  if curl -fsS --max-time 5 http://127.0.0.1:8080/readyz; then break; fi
+  sleep 1
+done
+curl -fsS http://127.0.0.1:8080/readyz
+sudo systemctl start petar-spool-runner.service
+```
+
+## 5. Operations: backup / restore
+
+Дамп БД не сохраняет spool и серверные роли. Для согласованной копии остановите
+все источники записи, runner и app, убедитесь в отсутствии активных CLI.
+PostgreSQL остаётся доступен. Сохраните БД и spool в одно окно остановки:
+
+```bash
+set -euo pipefail
+cd /opt/go-pet
+sudo systemctl stop petar-spool-runner.service
+docker stop petar_app
+# Подтвердите отсутствие других исполнителей/внешних записей в БД.
+mkdir -p /opt/go-pet/postgres/backups
+BACKUP="/opt/go-pet/postgres/backups/petar_db-$(date +%Y%m%d-%H%M%S).dump"
+docker exec petar_postgres pg_dump -U petar_user -d petar_db -Fc > "$BACKUP"
+test -s "$BACKUP"
+docker exec -i petar_postgres pg_restore --list < "$BACKUP"
+tar -C /opt/go-pet -czf "${BACKUP%.dump}-spool.tar.gz" spool
+tar -tzf "${BACKUP%.dump}-spool.tar.gz" >/dev/null
+```
+
+Храните копии вне этого хоста с подходящими правами/шифрованием; отдельно
+сохраните deployment-секреты и необходимые роли. Роль `petar_user` и база
+`petar_db` должны существовать до restore.
+
+**Восстановление разрушительно**: выберите конкретный проверенный backup,
+заранее сделайте копию текущего состояния. App/runner и внешние writers
+остановлены, PostgreSQL работает. `--clean --if-exists` удаляет восстанавливаемые
+объекты перед загрузкой, не очищает произвольные посторонние объекты.
+Расширения из dump должны быть доступны в образе.
+
+```bash
+set -euo pipefail
+read -r -p 'Полный путь к выбранному .dump: ' BACKUP
+test -s "$BACKUP"
+docker exec -i petar_postgres pg_restore \
+  -U petar_user -d petar_db --clean --if-exists --no-owner \
+  --exit-on-error < "$BACKUP"
+# Spool восстанавливайте из ПАРНОГО архива, не смешивая с текущими файлами.
+test -s "${BACKUP%.dump}-spool.tar.gz"
+SAVED_SPOOL="/opt/go-pet/spool-before-restore-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$SAVED_SPOOL"
+# Не переименовывать сам bind-mount root: контейнеры держат его inode.
+find /opt/go-pet/spool -mindepth 1 -maxdepth 1 -exec mv -t "$SAVED_SPOOL" -- {} +
+tar -C /opt/go-pet -xzf "${BACKUP%.dump}-spool.tar.gz"
+```
+
+Проверьте владельцев/ACL, таблицы и три функции командами bootstrap выше,
+просмотрите незавершённые jobs и processing: они сами не возобновятся.
+Согласуйте их адресно через recovery перед запуском runner.
+Затем `docker start petar_app`, ограниченное ожидание readyz (как в recovery),
+`curl -fsS http://127.0.0.1:8080/healthz` и
+`sudo systemctl start petar-spool-runner.service`.
+Не выполняйте restore/down на рабочей базе ради проверки документации.
+
+## 6. Testing & Quality Gate
+
+Это unit **и интеграционные** тесты: нужна PostgreSQL 18 со схемой.
+Используйте выделенное окружение, не рабочую БД: тесты меняют/чистят очередь.
+Gate не останавливает host runner, не применяет миграции и не задаёт DB_DSN.
+
+### Подготовка отдельной тестовой БД
+
+В доступном `petar_postgres` создайте **новую** `petar_docs_test` (не использовать
+повторно непроверенную БД с данными). Явно примените up-файлы:
+
+```bash
+set -euo pipefail
+cd /opt/go-pet
+docker exec petar_postgres createdb -U petar_user petar_docs_test
+for f in 000001_init_extensions.up.sql 000002_create_state_machine.up.sql 000003_db_state_functions.up.sql; do
+  docker exec -i petar_postgres psql -U petar_user -d petar_docs_test \
+    -v ON_ERROR_STOP=1 < "/opt/go-pet/postgres/migrations/$f"
+done
+```
+
+App в Compose по-прежнему использует `petar_db`; локальный тестовый DB_DSN
+указывает на **petar_docs_test**. Даже с отдельной БД остановите runner и app
+для прямых тестов; не запускайте параллельно другие тестовые процессы.
+Сохраните исходное состояние сервисов и восстановите только то, что работало:
+
+```bash
+APP_WAS_RUNNING=false
+RUNNER_WAS_RUNNING=false
+if docker ps --format '{{.Names}}' | grep -qx petar_app; then APP_WAS_RUNNING=true; fi
+if systemctl is-active --quiet petar-spool-runner.service; then RUNNER_WAS_RUNNING=true; fi
+restore_services() {
+  if [[ "$APP_WAS_RUNNING" == true ]]; then
+    docker start petar_app >/dev/null
+    for ((n=0; n<30; n++)); do
+      if curl -fsS --max-time 5 http://127.0.0.1:8080/readyz; then break; fi
+      sleep 1
+    done
+    curl -fsS http://127.0.0.1:8080/readyz || return 1
+  fi
+  if [[ "$RUNNER_WAS_RUNNING" == true ]]; then sudo systemctl start petar-spool-runner.service; fi
+}
+trap restore_services EXIT
+if [[ "$RUNNER_WAS_RUNNING" == true ]]; then sudo systemctl stop petar-spool-runner.service; fi
+if [[ "$APP_WAS_RUNNING" == true ]]; then docker stop petar_app >/dev/null; fi
+export DB_DSN='postgres://petar_user:petar_password@127.0.0.1:5432/petar_docs_test?sslmode=disable'
+GOFLAGS='-count=1' ./scripts/quality-gate.sh
+# Уйдя из этой Bash-сессии, выполнится trap восстановления.
+```
+
+Если runner был запущен вручную, его остановку/возврат организуйте отдельно.
+В обычном окружении с выделенной тестовой `petar_db` буквальная команда gate:
+
+```bash
+cd /opt/go-pet
+export DB_DSN='postgres://petar_user:petar_password@127.0.0.1:5432/petar_db?sslmode=disable'
+GOFLAGS='-count=1' ./scripts/quality-gate.sh
+```
+
+Gate буквально делает:
+
+1. `pg_isready` у `petar_postgres` для `petar_db` (даже если DB_DSN другой).
+2. Останавливает `petar_app`, только если тот работал; EXIT trap запускает обратно.
+3. В транзакции делает COUNT `sm_inputs`, `sm_processes`, `sm_jobs` и ROLLBACK
+   в `petar_db`, а не в произвольной БД из DB_DSN.
+4. `go vet ./...`.
+5. `go test -p=1 -v -race -timeout 30s ./...`.
+6. При успехе печатает `QUALITY GATE PASSED`.
+
+Несмотря на название сообщения “Migrations idempotency”, COUNT **не проверяет**
+идемпотентность или обратимость миграций. Проверка ниже отдельная.
+
+### Прямые race-тесты и SKIP LOCKED
+
+Запрошенная стандартная команда — `go test -v -race ./...`, но package-parallelism
+конфликтует с общей интеграционной БД. Рабочий вариант (в подготовленной сессии
+с DB_DSN и остановленными app/runner):
+
+```bash
+GOFLAGS='-p=1 -count=1' go test -v -race ./...
+go test -count=1 -v -race ./internal/db \
+  -run '^TestPickNextJob(SkipsLockedRow|Concurrent)$'
+```
+
+Первый SKIP LOCKED тест удерживает row lock и доказывает захват другой задачи;
+второй проверяет, что конкурентные захваты не получают один ID дважды.
+После проверки завершите Bash-сессию для trap либо вызовите
+`restore_services; trap - EXIT` после успешного восстановления.
+
+### Обратимость миграций: up → down → up
+
+**Только пустая одноразовая БД `petar_migration_test`, без app/runner,
+не рабочая `petar_db`.** Создание существующего имени должно завершиться ошибкой.
+Все SQL-файлы остаются в `/opt/go-pet/postgres/migrations/`; не создавайте
+SQL-файлы снаружи postgres и не используйте glob `*.sql`.
+
+```bash
+set -euo pipefail
+cd /opt/go-pet
+docker exec petar_postgres createdb -U petar_user petar_migration_test
+migration() {
+  docker exec -i petar_postgres psql -U petar_user -d petar_migration_test \
+    -v ON_ERROR_STOP=1 < "/opt/go-pet/postgres/migrations/$1"
+}
+check_up() {
+  docker exec -i petar_postgres psql -U petar_user -d petar_migration_test -v ON_ERROR_STOP=1 <<'SQL'
+DO $$
+BEGIN
+  IF to_regclass('sm_inputs') IS NULL OR to_regclass('sm_processes') IS NULL
+     OR to_regclass('sm_jobs') IS NULL OR to_regclass('sm_job_logs') IS NULL
+     OR to_regclass('sm_outputs') IS NULL
+     OR to_regprocedure('sm_create_input(text,jsonb)') IS NULL
+     OR to_regprocedure('sm_pick_next_job()') IS NULL
+     OR to_regprocedure('sm_update_job_status(uuid,text,text,text)') IS NULL THEN
+    RAISE EXCEPTION 'missing state machine objects';
+  END IF;
+  IF (SELECT count(*) FROM pg_extension WHERE extname IN ('vector','file_fdw','pg_trgm')) <> 3
+     OR NOT EXISTS (SELECT FROM pg_foreign_server WHERE srvname='dokuwiki_files') THEN
+    RAISE EXCEPTION 'missing extensions/server';
+  END IF;
+END $$;
+SQL
+}
+migration 000001_init_extensions.up.sql
+migration 000002_create_state_machine.up.sql
+migration 000003_db_state_functions.up.sql
+check_up
+migration 000003_db_state_functions.down.sql
+migration 000002_create_state_machine.down.sql
+migration 000001_init_extensions.down.sql
+docker exec -i petar_postgres psql -U petar_user -d petar_migration_test -v ON_ERROR_STOP=1 <<'SQL'
+DO $$
+BEGIN
+  IF to_regclass('sm_inputs') IS NOT NULL OR to_regclass('sm_processes') IS NOT NULL
+     OR to_regclass('sm_jobs') IS NOT NULL OR to_regclass('sm_job_logs') IS NOT NULL
+     OR to_regclass('sm_outputs') IS NOT NULL
+     OR to_regprocedure('sm_create_input(text,jsonb)') IS NOT NULL
+     OR to_regprocedure('sm_pick_next_job()') IS NOT NULL
+     OR to_regprocedure('sm_update_job_status(uuid,text,text,text)') IS NOT NULL
+     OR EXISTS (SELECT FROM pg_extension WHERE extname IN ('vector','file_fdw','pg_trgm'))
+     OR EXISTS (SELECT FROM pg_foreign_server WHERE srvname='dokuwiki_files') THEN
+    RAISE EXCEPTION 'objects remained after down';
+  END IF;
+END $$;
+SQL
+migration 000001_init_extensions.up.sql
+migration 000002_create_state_machine.up.sql
+migration 000003_db_state_functions.up.sql
+migration 000003_db_state_functions.up.sql
+check_up
+docker exec -i petar_postgres psql -U petar_user -d petar_migration_test -v ON_ERROR_STOP=1 <<'SQL'
+BEGIN;
+SELECT * FROM sm_create_input('migration-smoke','{"tool":"echo-test","message":"smoke"}'::jsonb);
+SELECT id AS job_id FROM sm_pick_next_job() \gset
+SELECT sm_update_job_status(:'job_id'::uuid,'completed','/spool/out/smoke/result.json',NULL);
+SELECT j.status,p.state,o.artifact_type,o.metadata
+FROM sm_jobs j JOIN sm_processes p ON p.id=j.process_id
+JOIN sm_outputs o ON o.process_id=p.id WHERE j.id=:'job_id'::uuid;
+ROLLBACK;
+SQL
+docker exec petar_postgres dropdb -U petar_user petar_migration_test
+```
+
+Повтор `000003` проверяет CREATE OR REPLACE, не идемпотентность `000002`.
+Down удаляет данные; обратимость структуры не означает их сохранность.
+Проверки внешних systemd, proxy, DokuWiki и реальных CLI требуют отдельного
+deployment-окружения; наличие примеров в README не означает, что они установлены.

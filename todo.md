@@ -110,3 +110,19 @@
     - `GET /api/v1/jobs` — фильтрация по query-параметрам `?process_id=...&status=...&limit=...&cursor=...`.
   - Покрыть тестами в `internal/api/server_test.go` (валидация, 404, сериализация JSON) и прогнать `./scripts/quality-gate.sh`.
   - Сделать git commit: `feat(api): add process status and jobs list endpoints`
+
+
+---
+
+## Phase 3: Documentation, Operations Runbook & Deployment Guide
+
+- [x] **Step 15: Актуализация `architecture.md` и `README.md` (схемы, развертывание, эксплуатация, тесты)**
+  - Обновить `architecture.md`:
+    - Привести описание в соответствие с реализацией Phase 1–2 (хранимые функции PG 18 `sm_create_input`, `sm_pick_next_job`, `sm_update_job_status`, HTTP API чтения `GET /api/v1/processes/{id}` и `GET /api/v1/jobs`, сквозной `X-Request-ID`).
+    - Добавить четкие ASCII/Unicode-диаграммы: общая топология компонентов (DokuWiki BFF -> Traefik -> `petar_app` -> PostgreSQL 18 <-> Spool <-> `spool-runner.sh`), жизненный цикл состояний (`sm_inputs` / `sm_processes` / `sm_jobs` / `sm_outputs`) и последовательность атомарного обмена через файловый мост `/spool`.
+  - Обновить `README.md` с добавлением практических разделов:
+    - **Развертывание (`Deployment`):** запуск стека через `docker compose up -d --build`, конфигурация переменных окружения, готовый `systemd`-юнит (`petar-spool-runner.service`) для хостового `scripts/spool-runner.sh` и конфигурация маршрутизации за reverse proxy (Traefik / Nginx) для интеграции с DokuWiki.
+    - **Эксплуатация (`Operations Runbook`):** рабочие примеры `curl` (включая `echo-test` и реальный пайплайн `yt-dlp` + `fabric`), просмотр аудита переходов в `sm_job_logs`, ручное восстановление зависших задач (`dispatched` / `in_progress`), бэкап и восстановление `petar_db` (`pg_dump` / `pg_restore`).
+    - **Тестирование (`Testing & Quality Gate`):** описание `./scripts/quality-gate.sh`, запуск unit/integration-тестов (`go test -v -race ./...`), проверка обратимости миграций (`up -> down -> up`), проверка конкурентного захвата `FOR UPDATE SKIP LOCKED` и полный ручной E2E-сценарий.
+  - Строго соблюсти протокол Gate -> Cross-Review (`@review`) -> Human Sign-off перед коммитом.
+  - Сделать git commit: `docs: update architecture and add operations, deployment, and testing guides`
