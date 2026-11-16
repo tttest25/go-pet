@@ -119,5 +119,5 @@ petar — легковесный оркестратор фоновых зада�
 
 ## 6. Out of Scope for Phase 1 (Moved to Phase 2)
 * Интеграция с Gemini API.
-* HTTP SSE-стриминг для DokuWiki.
+* HTTP SSE-стриминг для DokuWiki или javascript polling ? websocket ? 
 * Telegram-бот.
