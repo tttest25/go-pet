@@ -116,6 +116,12 @@
 
 ## Phase 3: Documentation, Operations Runbook & Deployment Guide
 
+- [x] **T16: Безопасный тестовый lifecycle и quality gate**
+  - Единый `PETAR_TEST_DB_DSN`, изолированная `petar_test`, явные prepare/check/reset.
+  - Общий lock lifecycle/gate/прямых тестов; без остановки app на другой БД.
+  - Strict TDD, два gate, прямой race-прогон и независимый review PASS; Human Sign-off получен.
+  - Подробный план: `.opencode/tasks/16_test_lifecycle_implementation_plan.md`.
+
 - [x] **Step 15: Актуализация `architecture.md` и `README.md` (схемы, развертывание, эксплуатация, тесты)**
   - Обновить `architecture.md`:
     - Привести описание в соответствие с реализацией Phase 1–2 (хранимые функции PG 18 `sm_create_input`, `sm_pick_next_job`, `sm_update_job_status`, HTTP API чтения `GET /api/v1/processes/{id}` и `GET /api/v1/jobs`, сквозной `X-Request-ID`).

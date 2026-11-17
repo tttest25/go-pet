@@ -18,7 +18,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"petar/internal/config"
 	"petar/internal/db"
 )
 
@@ -414,18 +413,14 @@ func TestWorkerStopsOnContextCancellation(t *testing.T) {
 }
 
 func TestSpoolWorkerIntegration(t *testing.T) {
-	cfg, err := config.Load()
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-
 	setupCtx, setupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer setupCancel()
-	database, err := db.New(setupCtx, cfg.DBDSN)
+	dsn := requireTestDSN(setupCtx, t)
+	database, err := db.New(setupCtx, dsn)
 	if err != nil {
 		t.Fatalf("create database: %v", err)
 	}
-	verification, err := pgxpool.New(setupCtx, cfg.DBDSN)
+	verification, err := pgxpool.New(setupCtx, dsn)
 	if err != nil {
 		database.Close()
 		t.Fatalf("create verification pool: %v", err)

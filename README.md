@@ -798,80 +798,70 @@ tar -C /opt/go-pet -xzf "${BACKUP%.dump}-spool.tar.gz"
 ## 6. Testing & Quality Gate
 
 Это unit **и интеграционные** тесты: нужна PostgreSQL 18 со схемой.
-Используйте выделенное окружение, не рабочую БД: тесты меняют/чистят очередь.
-Gate не останавливает host runner, не применяет миграции и не задаёт DB_DSN.
+Тесты меняют/чистят очередь и используют только `PETAR_TEST_DB_DSN`, без fallback
+на `DB_DSN` или production defaults. Разрешена только локальная
+`127.0.0.1:5432/petar_test`, пользователь `petar_user`, контейнер `petar_postgres`.
+URL и keyword/value DSN разбираются драйвером; неоднозначные маршруты, service,
+fallback hosts и runtime options отклоняются. Ошибки не должны содержать пароль.
 
 ### Подготовка отдельной тестовой БД
 
-В доступном `petar_postgres` создайте **новую** `petar_docs_test` (не использовать
-повторно непроверенную БД с данными). Явно примените up-файлы:
-
-```bash
-set -euo pipefail
-cd /opt/go-pet
-docker exec petar_postgres createdb -U petar_user petar_docs_test
-for f in 000001_init_extensions.up.sql 000002_create_state_machine.up.sql 000003_db_state_functions.up.sql; do
-  docker exec -i petar_postgres psql -U petar_user -d petar_docs_test \
-    -v ON_ERROR_STOP=1 < "/opt/go-pet/postgres/migrations/$f"
-done
-```
-
-App в Compose по-прежнему использует `petar_db`; локальный тестовый DB_DSN
-указывает на **petar_docs_test**. Даже с отдельной БД остановите runner и app
-для прямых тестов; не запускайте параллельно другие тестовые процессы.
-Сохраните исходное состояние сервисов и восстановите только то, что работало:
-
-```bash
-APP_WAS_RUNNING=false
-RUNNER_WAS_RUNNING=false
-if docker ps --format '{{.Names}}' | grep -qx petar_app; then APP_WAS_RUNNING=true; fi
-if systemctl is-active --quiet petar-spool-runner.service; then RUNNER_WAS_RUNNING=true; fi
-restore_services() {
-  if [[ "$APP_WAS_RUNNING" == true ]]; then
-    docker start petar_app >/dev/null
-    for ((n=0; n<30; n++)); do
-      if curl -fsS --max-time 5 http://127.0.0.1:8080/readyz; then break; fi
-      sleep 1
-    done
-    curl -fsS http://127.0.0.1:8080/readyz || return 1
-  fi
-  if [[ "$RUNNER_WAS_RUNNING" == true ]]; then sudo systemctl start petar-spool-runner.service; fi
-}
-trap restore_services EXIT
-if [[ "$RUNNER_WAS_RUNNING" == true ]]; then sudo systemctl stop petar-spool-runner.service; fi
-if [[ "$APP_WAS_RUNNING" == true ]]; then docker stop petar_app >/dev/null; fi
-export DB_DSN='postgres://petar_user:petar_password@127.0.0.1:5432/petar_docs_test?sslmode=disable'
-GOFLAGS='-count=1' ./scripts/quality-gate.sh
-# Уйдя из этой Bash-сессии, выполнится trap восстановления.
-```
-
-Если runner был запущен вручную, его остановку/возврат организуйте отдельно.
-В обычном окружении с выделенной тестовой `petar_db` буквальная команда gate:
+Подготовка отдельная и явная. Gate и прямые тесты не создают/не ремонтируют БД.
+При отсутствии DSN, ready-маркера или объектов схемы они завершаются с ошибкой,
+не пропускают интеграционные тесты.
 
 ```bash
 cd /opt/go-pet
-export DB_DSN='postgres://petar_user:petar_password@127.0.0.1:5432/petar_db?sslmode=disable'
+export PETAR_TEST_DB_DSN='postgres://petar_user:petar_password@127.0.0.1:5432/petar_test?sslmode=disable'
+./scripts/test-db.sh prepare
+./scripts/test-db.sh check
 GOFLAGS='-count=1' ./scripts/quality-gate.sh
 ```
 
-Gate буквально делает:
+`prepare` создаёт отсутствующую `petar_test`, ставит комментарий
+`petar:test-db:lifecycle=v1;state=preparing`, применяет только up
+000001 → 000002 → 000003 и после проверки схемы ставит `state=ready`.
+Повторный prepare готовой БД только проверяет её, не повторяет 000002.
+Существующая БД без маркера не «усыновляется»; частичная подготовка требует
+отдельного явного reset. Маркер защищает от случайного удаления, не от атак.
 
-1. `pg_isready` у `petar_postgres` для `petar_db` (даже если DB_DSN другой).
-2. Останавливает `petar_app`, только если тот работал; EXIT trap запускает обратно.
-3. В транзакции делает COUNT `sm_inputs`, `sm_processes`, `sm_jobs` и ROLLBACK
-   в `petar_db`, а не в произвольной БД из DB_DSN.
-4. `go vet ./...`.
-5. `go test -p=1 -v -race -timeout 30s ./...`.
-6. При успехе печатает `QUALITY GATE PASSED`.
+**Reset уничтожает все данные только маркированной `petar_test`** и пересоздаёт
+её тем же путём. Требуется точное подтверждение:
 
-Несмотря на название сообщения “Migrations idempotency”, COUNT **не проверяет**
-идемпотентность или обратимость миграций. Проверка ниже отдельная.
+```bash
+./scripts/test-db.sh reset --confirm petar_test
+```
+
+Reset неизвестной БД запрещён; активные соединения вызывают отказ.
+Никакого DROP FORCE, завершения чужих сессий или остановки app.
+App на `petar_db` продолжает работать; app на `petar_test` вызывает отказ.
+Runner и app **никогда не должны использовать тестовую БД**. Systemd не нужен.
+
+Gate под общим межпроцессным lock проверяет PG18, ready-маркер, таблицы,
+extensions, функции и штатные триггеры, затем выполняет `go vet ./...` и
+`go test -p=1 -count=1 -v -race -timeout 30s ./...`.
+Только при успехе печатает `QUALITY GATE PASSED`.
+Проверка объектов не доказывает идемпотентность/обратимость миграций.
+
+Один advisory flock в `postgres/.petar-test-db.lock` удерживается на весь
+lifecycle/gate или интеграционный test binary, включая cleanup. Поскольку
+`go test` не наследует произвольные FD в test binaries, gate передаёт тот же
+проверенный FD через приватный test-only Unix socket (`SCM_RIGHTS`), без
+самоблокировки. Недоступный relay не разрешает обход lock; socket очищается
+при завершении gate. Сам файл lock не удаляется.
+Ожидание ограничено. Это кооперативная локальная защита, не распределённый lock:
+нельзя запускать нескоординированные тесты из другого checkout/хоста, менять
+конфигурацию app во время тестов или вручную обходить guards.
+В частности, проверка маркера и `DROP DATABASE` — отдельные SQL-команды:
+нескоординированный администратор может изменить/подменить БД между ними.
+Reset допустим только при исключённом внешнем администрировании `petar_test`;
+flock сериализует участников протокола, но не суперпользователя PostgreSQL.
+Интеграционный spool остаётся в `t.TempDir()`, общий spool не очищается.
 
 ### Прямые race-тесты и SKIP LOCKED
 
-Запрошенная стандартная команда — `go test -v -race ./...`, но package-parallelism
-конфликтует с общей интеграционной БД. Рабочий вариант (в подготовленной сессии
-с DB_DSN и остановленными app/runner):
+Прямой запуск выбирает ту же БД и проверяет её до fixture-мутаций.
+Штатно сериализуйте пакеты (`-p=1`); lock также защищает от независимых запусков:
 
 ```bash
 GOFLAGS='-p=1 -count=1' go test -v -race ./...
@@ -881,8 +871,7 @@ go test -count=1 -v -race ./internal/db \
 
 Первый SKIP LOCKED тест удерживает row lock и доказывает захват другой задачи;
 второй проверяет, что конкурентные захваты не получают один ID дважды.
-После проверки завершите Bash-сессию для trap либо вызовите
-`restore_services; trap - EXIT` после успешного восстановления.
+Никаких остановки/возврата сервисов для этих тестов не требуется.
 
 ### Обратимость миграций: up → down → up
 

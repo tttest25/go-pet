@@ -19,7 +19,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"petar/internal/config"
 	"petar/internal/db"
 )
 
@@ -788,18 +787,14 @@ func TestRouting(t *testing.T) {
 }
 
 func TestServerIntegration(t *testing.T) {
-	cfg, err := config.Load()
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	database, err := db.New(ctx, cfg.DBDSN)
+	dsn := requireTestDSN(ctx, t)
+	database, err := db.New(ctx, dsn)
 	if err != nil {
 		t.Fatalf("create database: %v", err)
 	}
-	verification, err := pgxpool.New(ctx, cfg.DBDSN)
+	verification, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		database.Close()
 		t.Fatalf("create verification pool: %v", err)

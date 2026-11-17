@@ -1,41 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_WAS_RUNNING=false
-if docker ps --format '{{.Names}}' | grep -qx 'petar_app'; then
-    APP_WAS_RUNNING=true
-fi
-
+[[ $# == 0 ]] || { echo "Usage: quality-gate.sh" >&2; exit 2; }
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+temp="$(mktemp -d "${TMPDIR:-/tmp/opencode}/petar-quality-gate.XXXXXXXX")"
+child=""
 cleanup() {
-    if [[ "$APP_WAS_RUNNING" == "true" ]]; then
-        echo "=== [Cleanup] Restarting petar_app container ==="
-        docker start petar_app >/dev/null
-    fi
+  status=$?
+  trap - EXIT INT TERM
+  if [[ -n "$child" ]]; then
+    kill -TERM "$child" 2>/dev/null || true
+    wait "$child" 2>/dev/null || true
+  fi
+  rm -f -- "$temp/bridge"
+  rmdir -- "$temp"
+  exit "$status"
 }
 trap cleanup EXIT
-
-echo "=== [1/4] Checking PostgreSQL 18 container health ==="
-docker exec petar_postgres pg_isready -U petar_user -d petar_db >/dev/null
-
-if [[ "$APP_WAS_RUNNING" == "true" ]]; then
-    echo "=== [Prep] Pausing petar_app to prevent LISTEN/NOTIFY race ==="
-    docker stop petar_app >/dev/null
-fi
-
-echo "=== [2/4] Verifying SQL Migrations idempotency ==="
-docker exec -i petar_postgres psql -U petar_user -d petar_db -v ON_ERROR_STOP=1 <<'SQL'
-BEGIN;
-SELECT COUNT(*) FROM sm_inputs;
-SELECT COUNT(*) FROM sm_processes;
-SELECT COUNT(*) FROM sm_jobs;
-ROLLBACK;
-SQL
-
-echo "=== [3/4] Running go vet ==="
-go vet ./...
-
-echo "=== [4/4] Running go test with race detector ==="
-# Integration packages share a database, including queue and trigger state.
-go test -p=1 -v -race -timeout 30s ./...
-
-echo "QUALITY GATE PASSED"
+trap 'exit 130' INT
+trap 'exit 143' TERM
+env -u PETAR_TEST_DB_COMMAND -u PETAR_TEST_DB_CONFIRM go test -c -o "$temp/bridge" ./internal/db &
+child=$!
+wait "$child"
+child=""
+PETAR_TEST_DB_COMMAND=gate PETAR_TEST_DB_CONFIRM= \
+  "$temp/bridge" '-test.run=^TestPetarTestDBCommand$' -test.v &
+child=$!
+wait "$child"
+child=""

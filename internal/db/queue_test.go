@@ -17,7 +17,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"petar/internal/config"
 	"petar/internal/db"
 )
 
@@ -371,9 +370,15 @@ func TestQualityGateSerializesPackages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read quality gate: %v", err)
 	}
-	// Package integration suites share a database and must not overlap.
-	if !strings.Contains(string(script), "\ngo test -p=1 -v -race -timeout 30s ./...\n") {
-		t.Fatal("quality gate must run race tests with package parallelism -p=1")
+	bridge, err := os.ReadFile("test_lifecycle_test.go")
+	if err != nil {
+		t.Fatalf("read quality gate bridge: %v", err)
+	}
+	// Gate now owns the lock in its test-only bridge, which launches the suite.
+	// Keep the serialization, no-cache, race and finite-timeout contract explicit.
+	if !strings.Contains(string(script), "PETAR_TEST_DB_COMMAND=gate") ||
+		!strings.Contains(string(bridge), `{"test", "-p=1", "-count=1", "-v", "-race", "-timeout", "30s", "./..."}`) {
+		t.Fatal("quality gate bridge must run uncached race tests with package parallelism -p=1")
 	}
 }
 
@@ -566,20 +571,16 @@ type statusTransition struct {
 func newQueueTestEnv(t *testing.T, source string) *queueTestEnv {
 	t.Helper()
 
-	cfg, err := config.Load()
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	dsn := requireTestDSN(ctx, t)
 
-	database, err := db.New(ctx, cfg.DBDSN)
+	database, err := db.New(ctx, dsn)
 	if err != nil {
 		t.Fatalf("create database: %v", err)
 	}
 
-	pool, err := pgxpool.New(ctx, cfg.DBDSN)
+	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		database.Close()
 		t.Fatalf("create verification pool: %v", err)
