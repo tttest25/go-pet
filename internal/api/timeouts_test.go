@@ -33,6 +33,9 @@ func (f *waitingDatabase) GetProcess(ctx context.Context, _ uuid.UUID) (db.Proce
 func (f *waitingDatabase) CreateInput(ctx context.Context, _ string, _ json.RawMessage) (db.CreatedInput, error) {
 	return db.CreatedInput{}, f.wait(ctx, "CreateInput")
 }
+func (f *waitingDatabase) CreateAction(ctx context.Context, _ string, _ int32, _ json.RawMessage) (db.CreatedInput, error) {
+	return db.CreatedInput{}, f.wait(ctx, "CreateAction")
+}
 func (f *waitingDatabase) UpdateJobStatus(ctx context.Context, _ uuid.UUID, _ db.Status, _, _ string) error {
 	return f.wait(ctx, "UpdateJobStatus")
 }
@@ -47,6 +50,7 @@ func TestHTTPDatabaseTimeout(t *testing.T) {
 		{"GET", "/api/v1/jobs", "", "ListJobs", 504},
 		{"GET", "/api/v1/processes/" + id, "", "GetProcess", 504},
 		{"POST", "/api/v1/inputs", `{"source":"manual","payload":{"tool":"echo-test"}}`, "CreateInput", 504},
+		{"POST", "/api/v1/actions", `{"action":"echo-test","version":1,"data":{}}`, "CreateAction", 504},
 		{"POST", "/api/v1/jobs/" + id + "/status", `{"status":"in_progress"}`, "UpdateJobStatus", 504},
 		{"GET", "/readyz", "", "Ping", 503},
 	}

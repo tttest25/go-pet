@@ -16,12 +16,13 @@ type SpoolWriter struct {
 }
 
 type jobDocument struct {
-	ID        string          `json:"id"`
-	ProcessID string          `json:"process_id"`
-	ToolName  string          `json:"tool_name"`
-	Payload   json.RawMessage `json:"payload"`
-	OldStatus db.Status       `json:"old_status"`
-	Status    db.Status       `json:"status"`
+	ID            string          `json:"id"`
+	ProcessID     string          `json:"process_id"`
+	ToolName      string          `json:"tool_name"`
+	ActionVersion int32           `json:"action_version"`
+	Payload       json.RawMessage `json:"payload"`
+	OldStatus     db.Status       `json:"old_status"`
+	Status        db.Status       `json:"status"`
 }
 
 func NewWriter(spoolDir string) *SpoolWriter {
@@ -37,12 +38,13 @@ func (w *SpoolWriter) WriteJob(ctx context.Context, job *db.Job) error {
 	}
 
 	document := jobDocument{
-		ID:        job.ID.String(),
-		ProcessID: job.ProcessID.String(),
-		ToolName:  job.ToolName,
-		Payload:   job.Payload,
-		OldStatus: job.OldStatus,
-		Status:    job.Status,
+		ID:            job.ID.String(),
+		ProcessID:     job.ProcessID.String(),
+		ToolName:      job.ToolName,
+		ActionVersion: job.ActionVersion,
+		Payload:       job.Payload,
+		OldStatus:     job.OldStatus,
+		Status:        job.Status,
 	}
 	content, err := json.Marshal(document)
 	if err != nil {

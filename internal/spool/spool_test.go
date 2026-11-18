@@ -140,12 +140,13 @@ func (q *fakeQueue) addJob(job *db.Job) {
 
 func testJob() *db.Job {
 	return &db.Job{
-		ID:        uuid.New(),
-		ProcessID: uuid.New(),
-		ToolName:  "echo-test",
-		Payload:   json.RawMessage(`{"tool":"echo-test","message":"hello"}`),
-		OldStatus: db.StatusPending,
-		Status:    db.StatusDispatched,
+		ID:            uuid.New(),
+		ProcessID:     uuid.New(),
+		ToolName:      "echo-test",
+		ActionVersion: 1,
+		Payload:       json.RawMessage(`{"tool":"echo-test","message":"hello"}`),
+		OldStatus:     db.StatusPending,
+		Status:        db.StatusDispatched,
 	}
 }
 
@@ -243,6 +244,7 @@ func startTestWorker(
 func TestWriteJobCreatesJSON(t *testing.T) {
 	writer, root := newTestWriter(t)
 	job := testJob()
+	job.ActionVersion = 2
 
 	if err := writer.WriteJob(context.Background(), job); err != nil {
 		t.Fatalf("write job: %v", err)
@@ -271,6 +273,7 @@ func TestWriteJobCreatesJSON(t *testing.T) {
 	if document.ToolName != job.ToolName {
 		t.Fatalf("tool_name = %q, want %q", document.ToolName, job.ToolName)
 	}
+	requireSpoolActionVersion(t, content, 2)
 	if document.OldStatus != job.OldStatus || document.Status != job.Status {
 		t.Fatalf("statuses = %q/%q, want %q/%q",
 			document.OldStatus,
@@ -705,6 +708,16 @@ func TestWorkerWriterErrorStopsListenerRecovery(t *testing.T) {
 	log.checkErrors(t, []string{cause}, 0)
 }
 
+func requireSpoolActionVersion(t *testing.T, content []byte, want int) {
+	t.Helper()
+	var doc struct {
+		Version int `json:"action_version"`
+	}
+	if err := json.Unmarshal(content, &doc); err != nil || doc.Version != want {
+		t.Fatalf("spool action_version=%d, want %d (decode error: %v)", doc.Version, want, err)
+	}
+}
+
 func TestSpoolWorkerIntegration(t *testing.T) {
 	setupCtx, setupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer setupCancel()
@@ -741,29 +754,32 @@ func TestSpoolWorkerIntegration(t *testing.T) {
 	worker := NewWorker(database, writer, time.Hour, testLogger())
 	_, _ = startTestWorker(t, worker)
 
-	created, err := database.CreateInput(
-		setupCtx,
-		source,
-		json.RawMessage(`{"tool":"echo-test","message":"integration"}`),
-	)
+	// Publish the NOTIFY only after the test version is stored. This checks
+	// propagation from the DB, not support for launching v2 through the API.
+	tx, err := verification.Begin(setupCtx)
 	if err != nil {
-		t.Fatalf("create integration input: %v", err)
+		t.Fatal(err)
+	}
+	defer tx.Rollback(setupCtx)
+	var processID uuid.UUID
+	if err := tx.QueryRow(setupCtx, `SELECT process_id FROM sm_create_input($1,$2)`, source,
+		`{"tool":"echo-test","message":"integration"}`).Scan(&processID); err != nil {
+		t.Fatal(err)
 	}
 
 	var jobID uuid.UUID
-	if err := verification.QueryRow(
-		setupCtx,
-		`SELECT j.id
-		 FROM sm_jobs j
-		 JOIN sm_processes p ON p.id = j.process_id
-		 WHERE p.input_id = $1`,
-		created.InputID,
-	).Scan(&jobID); err != nil {
-		t.Fatalf("query integration job: %v", err)
+	var version int
+	if err := tx.QueryRow(setupCtx, `UPDATE sm_jobs SET action_version=2 WHERE process_id=$1
+		RETURNING id, action_version`, processID).Scan(&jobID, &version); err != nil {
+		t.Fatalf("set integration job version: %v", err)
+	}
+	if err := tx.Commit(setupCtx); err != nil {
+		t.Fatal(err)
 	}
 
 	path := filepath.Join(root, "in", jobID.String()+".json")
 	content := waitForFile(t, setupCtx, path)
+	requireSpoolActionVersion(t, content, version)
 	var document jobDocument
 	if err := json.Unmarshal(content, &document); err != nil {
 		t.Fatalf("decode integration JSON: %v", err)

@@ -30,12 +30,13 @@ type Input struct {
 }
 
 type Job struct {
-	ID        uuid.UUID
-	ProcessID uuid.UUID
-	ToolName  string
-	Payload   json.RawMessage
-	OldStatus Status
-	Status    Status
+	ID            uuid.UUID
+	ProcessID     uuid.UUID
+	ToolName      string
+	ActionVersion int32
+	Payload       json.RawMessage
+	OldStatus     Status
+	Status        Status
 }
 
 type JobDetails struct {

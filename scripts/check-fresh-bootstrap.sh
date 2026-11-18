@@ -60,8 +60,10 @@ SELECT srvname FROM pg_foreign_server;
 SELECT to_regclass('sm_inputs'), to_regclass('sm_processes'), to_regclass('sm_jobs'),
        to_regclass('sm_job_logs'), to_regclass('sm_outputs'), to_regclass('public.sm_actions');
 SELECT to_regprocedure('sm_create_input(text,jsonb)'),
+       to_regprocedure('public.sm_create_action(text,integer,jsonb)'),
        to_regprocedure('sm_validate_tool_payload(jsonb)'),
        to_regprocedure('sm_pick_next_job()'),
+       to_regprocedure('public.sm_pick_next_job_with_version()'),
        to_regprocedure('sm_update_job_status(uuid,text,text,text)');
 SELECT tgrelid::regclass, tgname, tgenabled FROM pg_trigger WHERE NOT tgisinternal ORDER BY tgname;
 SELECT current_setting('server_version_num')::int BETWEEN 180000 AND 189999
@@ -79,8 +81,13 @@ SELECT current_setting('server_version_num')::int BETWEEN 180000 AND 189999
           AND bool_or((action, version) = ('yt-dlp', 1))
         FROM public.sm_actions WHERE enabled)
    AND to_regprocedure('public.sm_create_input(text,jsonb)') IS NOT NULL
+   AND to_regprocedure('public.sm_create_action(text,integer,jsonb)') IS NOT NULL
+   AND EXISTS (SELECT FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='sm_jobs' AND column_name='action_version'
+          AND data_type='integer' AND is_nullable='NO' AND column_default='1')
    AND to_regprocedure('public.sm_validate_tool_payload(jsonb)') IS NOT NULL
    AND to_regprocedure('public.sm_pick_next_job()') IS NOT NULL
+   AND to_regprocedure('public.sm_pick_next_job_with_version()') IS NOT NULL
    AND to_regprocedure('public.sm_update_job_status(uuid,text,text,text)') IS NOT NULL
    AND (SELECT count(*) = 3 FROM pg_trigger
         WHERE NOT tgisinternal AND tgenabled IN ('O','A') AND
@@ -93,11 +100,20 @@ SELECT current_setting('server_version_num')::int BETWEEN 180000 AND 189999
 \endif
 BEGIN;
 SELECT * FROM sm_create_input('fresh-bootstrap-probe','{"tool":"echo-test"}') \gset
+SELECT * FROM public.sm_create_action('echo-test',1,'{"message":"bootstrap"}') \gset action_
 SELECT :'input_id' AS input_id, :'process_id' AS process_id, :'status' AS status;
-SELECT count(*) = 1 AND coalesce(bool_and(p.state='init' AND j.status='pending' AND j.tool_name='echo-test'),false)
-   AND :'status'='new' AS probe_ok
-FROM sm_processes p JOIN sm_jobs j ON j.process_id=p.id
-WHERE p.id=:'process_id' AND p.input_id=:'input_id' \gset
+WITH expected(input_id, process_id, status, source, payload) AS (
+    VALUES (:'input_id'::uuid, :'process_id'::uuid, :'status', 'fresh-bootstrap-probe', '{"tool":"echo-test"}'::jsonb),
+           (:'action_input_id'::uuid, :'action_process_id'::uuid, :'action_status', 'api',
+            '{"tool":"echo-test","message":"bootstrap"}'::jsonb)
+)
+SELECT count(*) = 2 AND count(DISTINCT e.input_id) = 2
+    AND bool_and(e.status='new' AND i.status='new' AND i.source=e.source AND i.payload=e.payload
+                 AND p.state='init' AND j.status='pending' AND j.tool_name='echo-test'
+                 AND j.action_version=1 AND j.payload=e.payload) AS probe_ok
+FROM expected e JOIN sm_inputs i ON i.id=e.input_id
+JOIN sm_processes p ON p.id=e.process_id AND p.input_id=i.id
+JOIN sm_jobs j ON j.process_id=p.id \gset
 \if :probe_ok
 \else
     DO $$ BEGIN RAISE EXCEPTION 'fresh bootstrap smoke input did not enqueue one pending job'; END $$;

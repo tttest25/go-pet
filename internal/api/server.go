@@ -28,6 +28,7 @@ type databaseAPI interface {
 	GetProcess(ctx context.Context, processID uuid.UUID) (db.ProcessDetails, error)
 	ListJobs(ctx context.Context, filter db.JobFilter) ([]db.JobDetails, error)
 	ListActions(ctx context.Context) ([]db.ActionVersion, error)
+	CreateAction(ctx context.Context, action string, version int32, data json.RawMessage) (db.CreatedInput, error)
 
 	CreateInput(
 		ctx context.Context,
@@ -54,6 +55,12 @@ type Server struct {
 type createInputRequest struct {
 	Source  string          `json:"source"`
 	Payload json.RawMessage `json:"payload"`
+}
+
+type createActionRequest struct {
+	Action  string          `json:"action"`
+	Version int32           `json:"version"`
+	Data    json.RawMessage `json:"data"`
 }
 
 type createInputResponse struct {
@@ -150,6 +157,7 @@ func newServer(database databaseAPI, logger *slog.Logger) *Server {
 	mux.HandleFunc("GET /api/v1/processes/{id}", server.handleGetProcess)
 	mux.HandleFunc("GET /api/v1/jobs", server.handleListJobs)
 	mux.HandleFunc("GET /api/v1/actions", server.handleListActions)
+	mux.HandleFunc("POST /api/v1/actions", server.handleCreateAction)
 	mux.HandleFunc("POST /api/v1/inputs", server.handleCreateInput)
 	mux.HandleFunc(
 		"POST /api/v1/jobs/{id}/status",
@@ -305,6 +313,35 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, statusResponse{Status: "ready"})
 }
 
+func (s *Server) handleCreateAction(w http.ResponseWriter, r *http.Request) {
+	var request createActionRequest
+	if err := decodeJSON(w, r, &request); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid JSON request body")
+		return
+	}
+	if strings.TrimSpace(request.Action) == "" || request.Version < 1 || request.Data == nil {
+		s.writeError(w, http.StatusBadRequest, "action, positive version and data are required")
+		return
+	}
+
+	ctx, cancel := context.WithTimeoutCause(r.Context(), s.databaseTimeout, errDatabaseDeadline)
+	defer cancel()
+	created, err := s.database.CreateAction(ctx, request.Action, request.Version, request.Data)
+	if err != nil {
+		if s.writeDatabaseTimeout(ctx, w) {
+			return
+		}
+		if errors.Is(err, db.ErrInvalidInput) {
+			s.writeError(w, http.StatusBadRequest, "invalid action input")
+			return
+		}
+		s.logger.Error("create action through HTTP API failed", "method", r.Method, "path", r.URL.Path, "error", err)
+		s.writeError(w, http.StatusInternalServerError, "failed to create action")
+		return
+	}
+	s.writeCreatedInput(w, created)
+}
+
 func (s *Server) handleCreateInput(w http.ResponseWriter, r *http.Request) {
 	var request createInputRequest
 	if err := decodeJSON(w, r, &request); err != nil {
@@ -343,6 +380,10 @@ func (s *Server) handleCreateInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.writeCreatedInput(w, created)
+}
+
+func (s *Server) writeCreatedInput(w http.ResponseWriter, created db.CreatedInput) {
 	s.writeJSON(w, http.StatusCreated, createInputResponse{
 		InputID:   created.InputID,
 		ProcessID: created.ProcessID,

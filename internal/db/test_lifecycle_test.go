@@ -309,15 +309,17 @@ var testMigrationNames = []string{
 	"000003_db_state_functions.up.sql",
 	"000004_validate_tool_payload.up.sql",
 	"000005_action_catalog.up.sql",
+	"000006_universal_json_input.up.sql",
 }
 
-func TestLifecycleMigrationOrderIncludesPayloadValidation(t *testing.T) {
+func TestLifecycleMigrationOrder(t *testing.T) {
 	want := []string{
 		"000001_init_extensions.up.sql",
 		"000002_create_state_machine.up.sql",
 		"000003_db_state_functions.up.sql",
 		"000004_validate_tool_payload.up.sql",
 		"000005_action_catalog.up.sql",
+		"000006_universal_json_input.up.sql",
 	}
 	if !slices.Equal(testMigrationNames, want) {
 		t.Fatalf("migration order = %v, want %v", testMigrationNames, want)
