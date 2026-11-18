@@ -110,6 +110,30 @@ func (d *DB) ListJobs(ctx context.Context, filter JobFilter) ([]JobDetails, erro
 	return jobs, nil
 }
 
+func (d *DB) ListActions(ctx context.Context) ([]ActionVersion, error) {
+	rows, err := d.pool.Query(ctx, `SELECT action, version, title
+		FROM public.sm_actions
+		WHERE enabled
+		ORDER BY action ASC, version ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("query enabled actions: %w", err)
+	}
+	defer rows.Close()
+
+	var actions []ActionVersion
+	for rows.Next() {
+		var action ActionVersion
+		if err := rows.Scan(&action.Action, &action.Version, &action.Title); err != nil {
+			return nil, fmt.Errorf("scan enabled action: %w", err)
+		}
+		actions = append(actions, action)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate enabled actions: %w", err)
+	}
+	return actions, nil
+}
+
 // ErrInvalidCallbackStatus indicates an invalid callback status.
 var ErrInvalidCallbackStatus = errors.New("invalid callback status")
 

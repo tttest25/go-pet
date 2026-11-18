@@ -52,7 +52,11 @@ func TestTestDSNContract(t *testing.T) {
 	}
 }
 
-var guardIntegrationTests = []string{"TestServerIntegration"}
+var guardIntegrationTests = []string{
+	"TestServerIntegration",
+	"TestListActionsReturnsEnabledVersions",
+	"TestListActionsDisablePreservesJob",
+}
 
 func TestDatabaseErrorsPreserveCauseWithoutCredentials(t *testing.T) {
 	cause := errors.New("driver error for postgres://petar_user:private-secret@127.0.0.1/petar_test")

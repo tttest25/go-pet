@@ -27,6 +27,7 @@ type databaseAPI interface {
 	Ping(ctx context.Context) error
 	GetProcess(ctx context.Context, processID uuid.UUID) (db.ProcessDetails, error)
 	ListJobs(ctx context.Context, filter db.JobFilter) ([]db.JobDetails, error)
+	ListActions(ctx context.Context) ([]db.ActionVersion, error)
 
 	CreateInput(
 		ctx context.Context,
@@ -74,6 +75,12 @@ type statusResponse struct {
 
 type errorResponse struct {
 	Error string `json:"error"`
+}
+
+type actionVersionResponse struct {
+	Action  string `json:"action"`
+	Version int    `json:"version"`
+	Title   string `json:"title"`
 }
 
 type processDetailsResponse struct {
@@ -142,6 +149,7 @@ func newServer(database databaseAPI, logger *slog.Logger) *Server {
 	mux.HandleFunc("GET /readyz", server.handleReadyz)
 	mux.HandleFunc("GET /api/v1/processes/{id}", server.handleGetProcess)
 	mux.HandleFunc("GET /api/v1/jobs", server.handleListJobs)
+	mux.HandleFunc("GET /api/v1/actions", server.handleListActions)
 	mux.HandleFunc("POST /api/v1/inputs", server.handleCreateInput)
 	mux.HandleFunc(
 		"POST /api/v1/jobs/{id}/status",
@@ -256,6 +264,28 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, http.StatusOK, jobsResponse(jobs))
+}
+
+func (s *Server) handleListActions(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeoutCause(r.Context(), s.databaseTimeout, errDatabaseDeadline)
+	defer cancel()
+	actions, err := s.database.ListActions(ctx)
+	if err != nil {
+		if s.writeDatabaseTimeout(ctx, w) {
+			return
+		}
+		s.logger.Error("list actions through HTTP API failed",
+			"method", r.Method, "path", r.URL.Path, "error", err)
+		s.writeError(w, http.StatusInternalServerError, "failed to list actions")
+		return
+	}
+	result := make([]actionVersionResponse, len(actions))
+	for i, action := range actions {
+		result[i] = actionVersionResponse{
+			Action: action.Action, Version: action.Version, Title: action.Title,
+		}
+	}
+	s.writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {

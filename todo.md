@@ -153,7 +153,7 @@
 
 - [x] **T22: Каталог действий в PostgreSQL.** Хранить идентификатор, версию, название и признак доступности; начальные действия — `echo-test`, `yt-dlp`, `fabric` версии 1. Проверять каталог в `sm_create_input` до вставки. Приёмка: корректный ввод создаёт одну цепочку; неизвестное/отключённое действие → `22023`, без input/process/job; legacy-контракт сохранён, миграция обратима на одноразовой БД. План: [.opencode/tasks/go_pet_actions_roadmap.md](.opencode/tasks/go_pet_actions_roadmap.md).
 
-- [ ] **T23: API чтения каталога.** `GET /api/v1/actions` читает доступные действия и версии из БД, без отдельного списка Go. Приёмка: новая запись появляется в API, отключённая исчезает из выбора, история заданий сохраняется. Зависит от T22. План: [.opencode/tasks/go_pet_actions_roadmap.md](.opencode/tasks/go_pet_actions_roadmap.md).
+- [x] **T23: API чтения каталога.** `GET /api/v1/actions` возвращает активные пары из PostgreSQL с `action,version,title` по возрастанию имени и версии; пустой каталог → `[]`. Приёмка: новая версия видна, отключённая исчезает, ранее созданный job доступен без изменений. Зависит от T22. План: [.opencode/tasks/23_actions_read_api.md](.opencode/tasks/23_actions_read_api.md).
 
 - [ ] **T24: Универсальный JSON-вход.** Go проверяет лимит, один JSON-документ и оболочку `action/version/data`, PostgreSQL — правила действия; `data` передаётся без повторного кодирования, отсутствие отличается от `null`. Приёмка: неверный JSON → 400 без вызова БД; отказ БД → 400 без новых строк; успех → 201; прежний `POST /api/v1/inputs` и успешный ответ совместимы. Зависит от T22, не требует T23 для прямых API-тестов. План: [.opencode/tasks/go_pet_actions_roadmap.md](.opencode/tasks/go_pet_actions_roadmap.md).
 

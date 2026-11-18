@@ -24,6 +24,9 @@ type waitingDatabase struct {
 func (f *waitingDatabase) ListJobs(ctx context.Context, _ db.JobFilter) ([]db.JobDetails, error) {
 	return nil, f.wait(ctx, "ListJobs")
 }
+func (f *waitingDatabase) ListActions(ctx context.Context) ([]db.ActionVersion, error) {
+	return nil, f.wait(ctx, "ListActions")
+}
 func (f *waitingDatabase) GetProcess(ctx context.Context, _ uuid.UUID) (db.ProcessDetails, error) {
 	return db.ProcessDetails{}, f.wait(ctx, "GetProcess")
 }

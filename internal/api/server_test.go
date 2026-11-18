@@ -27,6 +27,9 @@ type fakeDatabase struct {
 	getProcessErr                      error
 	listJobsResult                     []db.JobDetails
 	listJobsErr                        error
+	listActionsResult                  []db.ActionVersion
+	listActionsErr                     error
+	listActionsContext                 context.Context
 	getProcessCalls, listJobsCalls     int
 	getProcessID                       uuid.UUID
 	listJobsFilter                     db.JobFilter
@@ -74,6 +77,11 @@ func (f *fakeDatabase) ListJobs(ctx context.Context, filter db.JobFilter) ([]db.
 func (f *fakeDatabase) Ping(context.Context) error {
 	f.pingCalls++
 	return f.pingErr
+}
+
+func (f *fakeDatabase) ListActions(ctx context.Context) ([]db.ActionVersion, error) {
+	f.listActionsContext = ctx
+	return f.listActionsResult, f.listActionsErr
 }
 
 func (f *fakeDatabase) CreateInput(
@@ -878,6 +886,256 @@ func TestRouting(t *testing.T) {
 			)
 		}
 	}
+}
+
+func TestListActionsReturnsEnabledVersions(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	server, verification := newActionsIntegrationServer(ctx, t)
+	action := "t23-" + uuid.NewString()
+	for _, row := range readActions(t, server) {
+		if row.Action == action {
+			t.Fatalf("fixture action already exists: %q", action)
+		}
+	}
+
+	var inserted int64
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		tag, err := verification.Exec(ctx,
+			"DELETE FROM public.sm_actions WHERE action = $1 AND version IN (2, 3, 10)", action)
+		if err != nil {
+			t.Errorf("clean catalog fixture: %v", err)
+		} else if tag.RowsAffected() != inserted {
+			t.Errorf("deleted %d catalog rows, want %d", tag.RowsAffected(), inserted)
+		}
+	})
+	tag, err := verification.Exec(ctx, `INSERT INTO public.sm_actions (action, version, title, enabled)
+		VALUES ($1, 10, 'Version ten', true), ($1, 2, 'Version two', true), ($1, 3, 'Disabled', false)`, action)
+	if err != nil {
+		t.Fatalf("insert catalog fixture: %v", err)
+	}
+	inserted = tag.RowsAffected()
+	if inserted != 3 {
+		t.Fatalf("inserted %d catalog rows, want 3", inserted)
+	}
+
+	var actual []actionContract
+	for _, row := range readActions(t, server) {
+		if row.Action == action {
+			actual = append(actual, row)
+		}
+	}
+	want := []actionContract{{action, 2, "Version two"}, {action, 10, "Version ten"}}
+	if !reflect.DeepEqual(actual, want) {
+		t.Fatalf("fixture versions = %+v, want %+v", actual, want)
+	}
+}
+
+func TestListActionsEmpty(t *testing.T) {
+	server := newServer(newFakeDatabase(), apiTestLogger())
+	requireReadJSON(t, performRequest(server, http.MethodGet, "/api/v1/actions", ""),
+		http.StatusOK, []actionContract{})
+}
+
+func TestListActionsHasDatabaseDeadline(t *testing.T) {
+	f := newFakeDatabase()
+	server := newServer(f, apiTestLogger())
+	before := time.Now()
+	response := performRequest(server, http.MethodGet, "/api/v1/actions", "")
+	after := time.Now()
+	if response.Code != http.StatusOK || f.listActionsContext == nil {
+		t.Fatalf("status = %d, ListActions context = %v", response.Code, f.listActionsContext)
+	}
+	deadline, ok := f.listActionsContext.Deadline()
+	if !ok || deadline.Before(before.Add(5*time.Second)) || deadline.After(after.Add(5*time.Second)) {
+		t.Fatalf("deadline = %v, want within call interval + 5s", deadline)
+	}
+}
+
+func TestListActionsDatabaseErrors(t *testing.T) {
+	const path = "/api/v1/actions"
+	const message = "failed to list actions"
+	t.Run("internal error", func(t *testing.T) {
+		f := newFakeDatabase()
+		f.listActionsErr = errors.New("private catalog database details")
+		server := newServer(f, apiTestLogger())
+		requireReadJSON(t, performRequest(server, http.MethodGet, path, ""),
+			http.StatusInternalServerError, map[string]string{"error": message})
+	})
+	t.Run("database timeout", func(t *testing.T) {
+		parent, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		f := &waitingDatabase{wait: func(ctx context.Context, _ string) error {
+			<-ctx.Done()
+			return fmt.Errorf("wait for catalog: %w", ctx.Err())
+		}}
+		server := newServer(f, apiTestLogger())
+		server.databaseTimeout = 20 * time.Millisecond
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil).WithContext(parent))
+		requireReadJSON(t, response, http.StatusGatewayTimeout, map[string]string{"error": "database request timed out"})
+	})
+	t.Run("parent cancellation", func(t *testing.T) {
+		parent, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		f := &waitingDatabase{wait: func(ctx context.Context, _ string) error {
+			cancel()
+			<-ctx.Done()
+			if !errors.Is(ctx.Err(), context.Canceled) {
+				t.Errorf("database context error = %v, want Canceled", ctx.Err())
+			}
+			return fmt.Errorf("wait for catalog: %w", ctx.Err())
+		}}
+		server := newServer(f, apiTestLogger())
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil).WithContext(parent))
+		requireReadJSON(t, response, http.StatusInternalServerError, map[string]string{"error": message})
+	})
+}
+
+func TestListActionsDisablePreservesJob(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	server, verification := newActionsIntegrationServer(ctx, t)
+
+	source := "t23-" + uuid.NewString()
+	var createdInput bool
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		tag, err := verification.Exec(ctx, "DELETE FROM public.sm_inputs WHERE source = $1", source)
+		if err != nil {
+			t.Errorf("clean catalog test input: %v", err)
+		} else if createdInput && tag.RowsAffected() != 1 {
+			t.Errorf("deleted %d inputs, want 1", tag.RowsAffected())
+		}
+	})
+	body := fmt.Sprintf(`{"source":%q,"payload":{"tool":"echo-test"}}`, source)
+	response := performRequest(server, http.MethodPost, "/api/v1/inputs", body)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("POST input status = %d, want 201; body: %s", response.Code, response.Body)
+	}
+	createdInput = true
+	var created struct {
+		ProcessID uuid.UUID `json:"process_id"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &created); err != nil || created.ProcessID == uuid.Nil {
+		t.Fatalf("invalid input response: %s (decode error: %v)", response.Body, err)
+	}
+	jobsPath := "/api/v1/jobs?process_id=" + created.ProcessID.String()
+	readJob := func() map[string]json.RawMessage {
+		t.Helper()
+		response := performRequest(server, http.MethodGet, jobsPath, "")
+		if response.Code != http.StatusOK {
+			t.Fatalf("GET jobs status = %d, want 200; body: %s", response.Code, response.Body)
+		}
+		requireJSONContentType(t, response)
+		var jobs []map[string]json.RawMessage
+		if err := json.Unmarshal(response.Body.Bytes(), &jobs); err != nil || len(jobs) != 1 {
+			t.Fatalf("expected one job: %s (decode error: %v)", response.Body, err)
+		}
+		var id uuid.UUID
+		if err := json.Unmarshal(jobs[0]["id"], &id); err != nil || id == uuid.Nil {
+			t.Fatalf("invalid job ID: %s (decode error: %v)", jobs[0]["id"], err)
+		}
+		return jobs[0]
+	}
+	before := readJob()
+	hasEchoV1 := func() bool {
+		for _, row := range readActions(t, server) {
+			if row.Action == "echo-test" && row.Version == 1 {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasEchoV1() {
+		t.Fatal("echo-test v1 missing before disabling")
+	}
+
+	var originalEnabled bool
+	err := verification.QueryRow(ctx, `SELECT enabled FROM public.sm_actions
+		WHERE action = 'echo-test' AND version = 1`).Scan(&originalEnabled)
+	if err != nil {
+		t.Fatalf("read original seed availability: %v", err)
+	}
+	const setEnabled = `UPDATE public.sm_actions SET enabled = $1
+		WHERE action = 'echo-test' AND version = 1`
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		tag, err := verification.Exec(ctx, setEnabled, originalEnabled)
+		if err != nil {
+			t.Errorf("restore seed availability: %v", err)
+		} else if tag.RowsAffected() != 1 {
+			t.Errorf("restored %d seed rows, want 1", tag.RowsAffected())
+		}
+	})
+	tag, err := verification.Exec(ctx, setEnabled, false)
+	if err != nil || tag.RowsAffected() != 1 {
+		t.Fatalf("disable echo-test v1: updated %d rows (error: %v)", tag.RowsAffected(), err)
+	}
+	if hasEchoV1() {
+		t.Fatal("disabled echo-test v1 still in catalog")
+	}
+	if after := readJob(); !reflect.DeepEqual(after, before) {
+		t.Fatalf("job changed after disabling action: before %v, after %v", before, after)
+	}
+}
+
+func newActionsIntegrationServer(ctx context.Context, t *testing.T) (*Server, *pgxpool.Pool) {
+	t.Helper()
+	dsn := requireTestDSN(ctx, t)
+	database, err := db.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("create database: %v", err)
+	}
+	t.Cleanup(database.Close)
+	verification, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("create verification pool: %v", err)
+	}
+	t.Cleanup(verification.Close)
+	return NewServer(database, apiTestLogger()), verification
+}
+
+type actionContract struct {
+	Action  string `json:"action"`
+	Version int    `json:"version"`
+	Title   string `json:"title"`
+}
+
+func readActions(t *testing.T, server *Server) []actionContract {
+	t.Helper()
+	response := performRequest(server, http.MethodGet, "/api/v1/actions", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/actions status = %d, want 200; body: %s", response.Code, response.Body)
+	}
+	requireJSONContentType(t, response)
+	var objects []map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &objects); err != nil || objects == nil {
+		t.Fatalf("expected catalog JSON array: %s (decode error: %v)", response.Body, err)
+	}
+	rows := make([]actionContract, len(objects))
+	for i, obj := range objects {
+		if len(obj) != 3 || obj["action"] == nil || obj["version"] == nil || obj["title"] == nil {
+			t.Fatalf("unexpected action keys: %v", obj)
+		}
+		for key, dest := range map[string]any{"action": &rows[i].Action, "version": &rows[i].Version, "title": &rows[i].Title} {
+			if err := json.Unmarshal(obj[key], dest); err != nil || string(obj[key]) == "null" {
+				t.Fatalf("invalid action field %s: %s (decode error: %v)", key, obj[key], err)
+			}
+		}
+		if i > 0 {
+			prev, row := rows[i-1], rows[i]
+			if prev.Action > row.Action || (prev.Action == row.Action && prev.Version >= row.Version) {
+				t.Fatalf("catalog is not ordered by (action, version): %+v before %+v", prev, row)
+			}
+		}
+	}
+	return rows
 }
 
 func TestServerIntegration(t *testing.T) {

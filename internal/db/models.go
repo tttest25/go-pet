@@ -77,3 +77,9 @@ type JobFilter struct {
 	Limit     int
 	CursorID  *uuid.UUID
 }
+
+type ActionVersion struct {
+	Action  string
+	Version int
+	Title   string
+}
