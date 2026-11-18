@@ -92,7 +92,7 @@ PostgreSQL ограничен `mem_limit: 450m`, `max_connections=20`, `io_metho
 │   └── api/                     # net/http ServeMux, JSON, logging middleware
 ├── postgres/                    # Вся инфраструктура и SQL БД
 │   ├── data/                    # Bind mount данных, исключён из Git
-│   ├── migrations/              # Пары up/down: 000001, 000002, 000003
+│   ├── migrations/              # Пары up/down: 000001–000004
 │   └── postgresql.conf          # PostgreSQL 18, лимиты, io_method
 ├── scripts/
 │   ├── spool-runner.sh          # Хостовый исполнитель
@@ -143,12 +143,15 @@ UUID PK таблиц используют нативную `uuidv7()` PostgreSQL
 
 | Функция | Контракт |
 | --- | --- |
-| `sm_create_input(p_source,p_payload)` | Создаёт input; возвращает `input_id,process_id,status` |
+| `sm_create_input(p_source,p_payload)` | Вызывает `sm_validate_tool_payload` до вставки, затем создаёт input; возвращает `input_id,process_id,status` |
 | `sm_pick_next_job()` | Атомарно выбирает pending по `priority DESC,created_at ASC`, `FOR UPDATE SKIP LOCKED`, переводит в dispatched; возвращает `id,process_id,tool_name,payload,old_status,status` |
 | `sm_update_job_status(p_job_id,p_status,p_result_path,p_error_msg)` | Принимает только исходные `dispatched/in_progress` и целевые `in_progress/completed/failed`; возвращает VOID; пустые строки путей/ошибок превращает в NULL |
 
 `trg_sm_inputs_after_insert` создаёт **один процесс и одну задачу** из `payload->>'tool'`
 в той же транзакции; ошибка откатывает всю цепочку.
+Валидация payload — контракт `sm_create_input`, а не новое ограничение триггера
+или таблицы. Прямой INSERT сохраняет прежнее поведение. Миграция `000004`
+не меняет ранее созданные задания; её down восстанавливает прежнее тело функции.
 `trg_sm_jobs_notify` вызывает `pg_notify('sm_jobs_channel', NEW.id::text)` при INSERT pending
 или изменении статуса на pending. Уведомление доставляется после COMMIT.
 `trg_sm_jobs_status_audit` срабатывает только при фактическом изменении статуса,
@@ -267,8 +270,13 @@ JSON-формата для всех стандартных ответов ServeM
 ### Создание input и callback
 
 Вход: `{"source":"manual","payload":{"tool":"echo-test","message":"hello"}}`.
-`source` после trim непустой; payload — JSON-объект с поддерживаемым `tool`.
-Специфичные для CLI поля обрабатывает runner, а не HTTP-валидатор.
+`source` после trim непустой; payload — JSON-объект. Функция БД проверяет точное
+имя `tool` и поля инструмента: `echo-test.message` необязателен (по умолчанию
+`default echo`); `yt-dlp.url` — абсолютный HTTP(S) URL с host; `fabric.text` —
+непустая строка, необязательный `pattern` — `[A-Za-z0-9_-]{1,128}` (по умолчанию
+`summarize`). Явный `null` не заменяет отсутствующее поле. Строки и дополнительные
+поля не переписываются. Неверный payload даёт SQLSTATE `22023` → HTTP 400
+без вставок; остальные ошибки создания в БД дают HTTP 500.
 
 Ответ содержит `input_id,process_id,status:"new",id`; легаси `id` равен `input_id`,
 **не job ID**. Job ID получают через GET процесса или списка задач.
@@ -353,5 +361,6 @@ Liveness не проверяет БД; readiness проверяет её дос�
 [middleware](internal/api/middleware.go), [DB queries](internal/db/queue.go),
 [state machine](postgres/migrations/000002_create_state_machine.up.sql),
 [stored functions](postgres/migrations/000003_db_state_functions.up.sql),
+[payload validation](postgres/migrations/000004_validate_tool_payload.up.sql),
 [writer](internal/spool/writer.go), [worker](internal/spool/worker.go),
 [runner](scripts/spool-runner.sh), [Compose](docker-compose.yml).

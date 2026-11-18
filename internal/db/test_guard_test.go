@@ -390,6 +390,7 @@ func checkTestSchema(ctx context.Context, conn *pgx.Conn) error {
 	(SELECT count(*)=5 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind='r' AND c.relname IN ('sm_inputs','sm_processes','sm_jobs','sm_job_logs','sm_outputs'))
 	AND (SELECT count(*)=3 FROM pg_extension WHERE extname IN ('vector','file_fdw','pg_trgm'))
 	AND to_regprocedure('public.sm_create_input(text,jsonb)') IS NOT NULL
+	AND to_regprocedure('public.sm_validate_tool_payload(jsonb)') IS NOT NULL
 	AND to_regprocedure('public.sm_pick_next_job()') IS NOT NULL
 	AND to_regprocedure('public.sm_update_job_status(uuid,text,text,text)') IS NOT NULL
 	AND (SELECT count(*)=3 FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace

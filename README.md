@@ -92,6 +92,7 @@ SELECT srvname FROM pg_foreign_server;
 SELECT to_regclass('sm_inputs'), to_regclass('sm_processes'), to_regclass('sm_jobs'),
        to_regclass('sm_job_logs'), to_regclass('sm_outputs');
 SELECT to_regprocedure('sm_create_input(text,jsonb)'),
+       to_regprocedure('sm_validate_tool_payload(jsonb)'),
        to_regprocedure('sm_pick_next_job()'),
        to_regprocedure('sm_update_job_status(uuid,text,text,text)');
 SQL
@@ -100,14 +101,14 @@ SQL
 Существующая БД: при наличии объектов не повторять `000002` — она не идемпотентна.
 Пустое окружение: после завершения initdb проверьте результаты выше и логи.
 Следующая функция позволяет **явно** применить только недостающие up-файлы
-в порядке 000001 → 000002 → 000003; выполняйте соответствующие вызовы лишь
+в порядке 000001 → 000002 → 000003 → 000004; выполняйте соответствующие вызовы лишь
 после проверки, не все автоматически:
 
 ```bash
 cd /opt/go-pet
 apply_up() {
-  docker exec -i petar_postgres psql -U petar_user -d petar_db \
-    -v ON_ERROR_STOP=1 < "/opt/go-pet/postgres/migrations/$1"
+  docker exec -i petar_postgres psql -X -1 -U petar_user -d petar_db \
+    -v ON_ERROR_STOP=1 -f - < "/opt/go-pet/postgres/migrations/$1"
 }
 # Если отсутствуют расширения vector/file_fdw/pg_trgm или сервер dokuwiki_files:
 # apply_up 000001_init_extensions.up.sql
@@ -115,6 +116,8 @@ apply_up() {
 # apply_up 000002_create_state_machine.up.sql
 # Если отсутствуют хранимые функции:
 # apply_up 000003_db_state_functions.up.sql
+# Если база уже на 000003, но нет sm_validate_tool_payload:
+# apply_up 000004_validate_tool_payload.up.sql
 ```
 
 `000001` использует IF NOT EXISTS, `000003` — CREATE OR REPLACE.
@@ -122,6 +125,13 @@ apply_up() {
 **остановитесь и разберите несоответствие**, не запускайте down/повторный `000002`
 на рабочей БД. После применения повторите проверку объектов.
 В `postgresql.conf` для WSL стоит `io_method='worker'`.
+
+При обновлении с `000003` приостановите приём новых input, примените только
+`000004_validate_tool_payload.up.sql`, разверните совместимый Go-код и возобновите
+приём. Старый API может вернуть 500 вместо 400, если новая функция уже отклоняет
+payload. Для отката используйте `000004_validate_tool_payload.down.sql` и
+прежнюю версию приложения в том же окне остановленного приёма. Откат восстанавливает
+прежнее тело `sm_create_input`; он не удаляет записи и не переобрабатывает очередь.
 
 ### Старт приложения
 
@@ -379,9 +389,21 @@ curl -fsS --get -H 'Host: petar.example.test' \
 | `GET /api/v1/jobs` | 200 массив | 400, 500 |
 
 POST принимает ровно один JSON-документ до 1 MiB, неизвестные поля верхнего
-уровня отклоняются. Source должен быть непустым после trim; payload — объект
-с tool `echo-test`, `yt-dlp` или `fabric`. Дополнительные поля payload допускаются.
-Используйте точное написание tool без пробелов: проверка API не переписывает payload.
+уровня отклоняются. Source должен быть непустым после trim; payload — объект.
+`sm_create_input` проверяет точное имя `tool` без пробелов и поля инструмента:
+
+| `tool` | Поля payload |
+| --- | --- |
+| `echo-test` | `message` необязателен: отсутствие означает `default echo`; если задан, это непустая, не состоящая из пробелов строка. |
+| `yt-dlp` | Обязательный `url`: абсолютный HTTP(S) URL с непустым host (для IDN используйте ASCII/Punycode). Проверка синтаксическая, без сетевого запроса. |
+| `fabric` | Обязательный непустой строковый `text`; необязательный `pattern` из 1–128 символов `[A-Za-z0-9_-]`, при отсутствии — `summarize`. |
+
+Отсутствующий необязательный ключ не равен явному `null`: `null` отклоняется.
+Дополнительные поля допускаются и сохраняются, строки не переписываются.
+Примеры: `{"tool":"echo-test"}`, `{"tool":"yt-dlp","url":"https://example.org/video"}`,
+`{"tool":"fabric","text":"Текст для обработки"}`. Неверный payload даёт 400
+без создания input/process/job. Эти правила не распространяются на прямой
+`INSERT INTO sm_inputs`, который остаётся под прежними ограничениями БД.
 Ошибки обработчиков имеют `{"error":"..."}`; стандартные ответы ServeMux
 (например 405) не обязаны иметь такой JSON.
 
@@ -820,8 +842,12 @@ GOFLAGS='-count=1' ./scripts/quality-gate.sh
 
 `prepare` создаёт отсутствующую `petar_test`, ставит комментарий
 `petar:test-db:lifecycle=v1;state=preparing`, применяет только up
-000001 → 000002 → 000003 и после проверки схемы ставит `state=ready`.
+000001 → 000002 → 000003 → 000004 и после проверки схемы ставит `state=ready`.
 Повторный prepare готовой БД только проверяет её, не повторяет 000002.
+На уже готовой `petar_test` с `000003` `prepare` и `check` сообщат об отсутствии
+валидатора, не обновляя схему автоматически. Для обновления без reset сначала
+проверьте цель и её принадлежность тестовому lifecycle, затем примените только
+`000004.up` к этой БД под общим `flock` и повторите `check`.
 Существующая БД без маркера не «усыновляется»; частичная подготовка требует
 отдельного явного reset. Маркер защищает от случайного удаления, не от атак.
 
@@ -896,6 +922,7 @@ BEGIN
      OR to_regclass('sm_jobs') IS NULL OR to_regclass('sm_job_logs') IS NULL
      OR to_regclass('sm_outputs') IS NULL
      OR to_regprocedure('sm_create_input(text,jsonb)') IS NULL
+     OR to_regprocedure('sm_validate_tool_payload(jsonb)') IS NULL
      OR to_regprocedure('sm_pick_next_job()') IS NULL
      OR to_regprocedure('sm_update_job_status(uuid,text,text,text)') IS NULL THEN
     RAISE EXCEPTION 'missing state machine objects';
@@ -910,7 +937,9 @@ SQL
 migration 000001_init_extensions.up.sql
 migration 000002_create_state_machine.up.sql
 migration 000003_db_state_functions.up.sql
+migration 000004_validate_tool_payload.up.sql
 check_up
+migration 000004_validate_tool_payload.down.sql
 migration 000003_db_state_functions.down.sql
 migration 000002_create_state_machine.down.sql
 migration 000001_init_extensions.down.sql
@@ -921,6 +950,7 @@ BEGIN
      OR to_regclass('sm_jobs') IS NOT NULL OR to_regclass('sm_job_logs') IS NOT NULL
      OR to_regclass('sm_outputs') IS NOT NULL
      OR to_regprocedure('sm_create_input(text,jsonb)') IS NOT NULL
+     OR to_regprocedure('sm_validate_tool_payload(jsonb)') IS NOT NULL
      OR to_regprocedure('sm_pick_next_job()') IS NOT NULL
      OR to_regprocedure('sm_update_job_status(uuid,text,text,text)') IS NOT NULL
      OR EXISTS (SELECT FROM pg_extension WHERE extname IN ('vector','file_fdw','pg_trgm'))
@@ -933,6 +963,7 @@ migration 000001_init_extensions.up.sql
 migration 000002_create_state_machine.up.sql
 migration 000003_db_state_functions.up.sql
 migration 000003_db_state_functions.up.sql
+migration 000004_validate_tool_payload.up.sql
 check_up
 docker exec -i petar_postgres psql -U petar_user -d petar_migration_test -v ON_ERROR_STOP=1 <<'SQL'
 BEGIN;
@@ -948,6 +979,11 @@ docker exec petar_postgres dropdb -U petar_user petar_migration_test
 ```
 
 Повтор `000003` проверяет CREATE OR REPLACE, не идемпотентность `000002`.
-Down удаляет данные; обратимость структуры не означает их сохранность.
+При полном down `000002.down` удаляет таблицы с данными. Для проверки **только**
+`000004` на одноразовой базе примените `000001`–`000003` и создайте контрольный
+input с задачей. Выполните `000004.up → 000004.down → 000004.up`: один и тот же
+новый `{"tool":"fabric"}` через `sm_create_input` должен дать соответственно
+SQLSTATE `22023`, успешный ответ, снова `22023`. Контрольные ID должны
+сохраниться на всех трёх шагах.
 Проверки внешних systemd, proxy, DokuWiki и реальных CLI требуют отдельного
 deployment-окружения; наличие примеров в README не означает, что они установлены.

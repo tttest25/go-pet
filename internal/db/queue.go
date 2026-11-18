@@ -113,6 +113,9 @@ func (d *DB) ListJobs(ctx context.Context, filter JobFilter) ([]JobDetails, erro
 // ErrInvalidCallbackStatus indicates an invalid callback status.
 var ErrInvalidCallbackStatus = errors.New("invalid callback status")
 
+// ErrInvalidInput indicates that sm_create_input rejected the payload.
+var ErrInvalidInput = errors.New("invalid input")
+
 func mapQueueError(err error) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
@@ -138,6 +141,10 @@ func (d *DB) CreateInput(ctx context.Context, source string, payload json.RawMes
 		&created.InputID, &created.ProcessID, &created.Status,
 	)
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "22023" {
+			return CreatedInput{}, fmt.Errorf("create input from source %q: %w: %w", source, ErrInvalidInput, err)
+		}
 		return CreatedInput{}, fmt.Errorf("create input from source %q: %w", source, mapQueueError(err))
 	}
 	return created, nil

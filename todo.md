@@ -132,3 +132,5 @@
     - **Тестирование (`Testing & Quality Gate`):** описание `./scripts/quality-gate.sh`, запуск unit/integration-тестов (`go test -v -race ./...`), проверка обратимости миграций (`up -> down -> up`), проверка конкурентного захвата `FOR UPDATE SKIP LOCKED` и полный ручной E2E-сценарий.
   - Строго соблюсти протокол Gate -> Cross-Review (`@review`) -> Human Sign-off перед коммитом.
   - Сделать git commit: `docs: update architecture and add operations, deployment, and testing guides`
+
+- [x] **T17: Проверять payload в PostgreSQL до постановки задания в очередь.** Миграция `000004` вводит проверку в `sm_create_input` для `echo-test`, `yt-dlp`, `fabric`; отсутствие `message` сохраняет `default echo`. Неверный payload → SQLSTATE `22023` → HTTP 400, без создания input/process/job. Приёмка: SQL/HTTP regression, обратимость `up → down → up`, quality gate. План: `.opencode/tasks/17_todo_entry.md`.

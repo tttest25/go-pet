@@ -266,6 +266,10 @@ func TestCreateInputValidation(t *testing.T) {
 		{name: "empty body", body: ""},
 		{name: "malformed JSON", body: `{"`},
 		{
+			name: "oversized body",
+			body: `{"source":"manual","payload":{"tool":"echo-test","message":"` + strings.Repeat("x", 1<<20) + `"}}`,
+		},
+		{
 			name: "multiple documents",
 			body: `{"source":"manual","payload":{"tool":"echo-test"}} {}`,
 		},
@@ -289,14 +293,6 @@ func TestCreateInputValidation(t *testing.T) {
 		{
 			name: "payload is string",
 			body: `{"source":"manual","payload":"echo-test"}`,
-		},
-		{
-			name: "missing tool",
-			body: `{"source":"manual","payload":{"message":"hello"}}`,
-		},
-		{
-			name: "unsupported tool",
-			body: `{"source":"manual","payload":{"tool":"unsupported"}}`,
 		},
 	}
 
@@ -326,14 +322,27 @@ func TestCreateInputDatabaseError(t *testing.T) {
 	tests := []struct {
 		name string
 		err  error
+		want int
 	}{
 		{
 			name: "insert failure",
 			err:  errors.New("sensitive insert failure"),
+			want: http.StatusInternalServerError,
 		},
 		{
 			name: "created process is missing",
 			err:  fmt.Errorf("sensitive process lookup failure: %w", pgx.ErrNoRows),
+			want: http.StatusInternalServerError,
+		},
+		{
+			name: "wrapped invalid input",
+			err:  fmt.Errorf("sensitive validator details: %w", db.ErrInvalidInput),
+			want: http.StatusBadRequest,
+		},
+		{
+			name: "callback sentinel is not an input error",
+			err:  fmt.Errorf("sensitive callback details: %w", db.ErrInvalidCallbackStatus),
+			want: http.StatusInternalServerError,
 		},
 	}
 
@@ -349,11 +358,78 @@ func TestCreateInputDatabaseError(t *testing.T) {
 				"/api/v1/inputs",
 				`{"source":"manual","payload":{"tool":"echo-test"}}`,
 			)
-			if response.Code != http.StatusInternalServerError {
-				t.Fatalf("status = %d, want 500", response.Code)
+			if response.Code != test.want {
+				t.Fatalf("status = %d, want %d", response.Code, test.want)
 			}
 			if strings.Contains(response.Body.String(), "sensitive") {
 				t.Fatalf("response leaked internal error: %s", response.Body)
+			}
+			if database.createInputCalls != 1 {
+				t.Fatalf("CreateInput calls = %d, want 1", database.createInputCalls)
+			}
+		})
+	}
+}
+
+func TestCreateInputPayloadIntegration(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	dsn := requireTestDSN(ctx, t)
+	database, err := db.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	server := newServer(database, apiTestLogger())
+
+	for _, tc := range []struct {
+		name, payload string
+		want          int
+	}{
+		{"default echo", `{"tool":"echo-test"}`, 201},
+		{"web URL", `{"tool":"yt-dlp","url":"https://example.org/video"}`, 201},
+		{"default pattern", `{"tool":"fabric","text":"body"}`, 201},
+		{"missing tool", `{"message":"hello"}`, 400},
+		{"unknown tool", `{"tool":"unsupported"}`, 400},
+		{"padded tool", `{"tool":" echo-test "}`, 400},
+		{"null message", `{"tool":"echo-test","message":null}`, 400},
+		{"missing text", `{"tool":"fabric"}`, 400},
+		{"invalid pattern", `{"tool":"fabric","text":"body","pattern":"../x"}`, 400},
+		{"invalid URL", `{"tool":"yt-dlp","url":"https:///video"}`, 400},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source := "t17-http-" + uuid.NewString()
+			t.Cleanup(func() {
+				cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if _, err := pool.Exec(cleanup, `DELETE FROM sm_inputs WHERE source=$1`, source); err != nil {
+					t.Error(err)
+				}
+			})
+			response := performRequest(server, http.MethodPost, "/api/v1/inputs",
+				fmt.Sprintf(`{"source":%q,"payload":%s}`, source, tc.payload))
+			if response.Code != tc.want {
+				t.Errorf("status = %d, want %d: %s", response.Code, tc.want, response.Body)
+			}
+			if tc.want == 201 {
+				var created createInputResponse
+				if err := json.Unmarshal(response.Body.Bytes(), &created); err != nil ||
+					created.InputID == uuid.Nil || created.ProcessID == uuid.Nil || created.ID != created.InputID || created.Status != "new" {
+					t.Fatalf("invalid successful response: %s (%v)", response.Body, err)
+				}
+			} else {
+				if response.Body.String() != "{\"error\":\"invalid payload\"}\n" {
+					t.Errorf("unexpected rejection response: %s", response.Body)
+				}
+				var count int
+				if err := pool.QueryRow(ctx, `SELECT count(*) FROM sm_inputs WHERE source=$1`, source).Scan(&count); err != nil || count != 0 {
+					t.Errorf("input count after failure = %d, %v", count, err)
+				}
 			}
 		})
 	}

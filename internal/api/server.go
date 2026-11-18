@@ -271,13 +271,17 @@ func (s *Server) handleCreateInput(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "source is required")
 		return
 	}
-	if _, err := validateInputPayload(request.Payload); err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
+	if len(request.Payload) == 0 || request.Payload[0] != '{' {
+		s.writeError(w, http.StatusBadRequest, "payload must be a JSON object")
 		return
 	}
 
 	created, err := s.database.CreateInput(r.Context(), source, request.Payload)
 	if err != nil {
+		if errors.Is(err, db.ErrInvalidInput) {
+			s.writeError(w, http.StatusBadRequest, "invalid payload")
+			return
+		}
 		s.logger.Error(
 			"create input through HTTP API failed",
 			"method", r.Method,
@@ -362,37 +366,6 @@ func (s *Server) handleUpdateJobStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
-}
-
-func validateInputPayload(payload json.RawMessage) (string, error) {
-	if len(payload) == 0 {
-		return "", errors.New("payload is required")
-	}
-
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal(payload, &object); err != nil {
-		return "", fmt.Errorf("payload must be a JSON object: %w", err)
-	}
-	if object == nil {
-		return "", errors.New("payload must be a JSON object")
-	}
-
-	rawTool, ok := object["tool"]
-	if !ok {
-		return "", errors.New("payload.tool is required")
-	}
-	var tool string
-	if err := json.Unmarshal(rawTool, &tool); err != nil {
-		return "", fmt.Errorf("payload.tool must be a string: %w", err)
-	}
-
-	tool = strings.TrimSpace(tool)
-	switch tool {
-	case "echo-test", "yt-dlp", "fabric":
-		return tool, nil
-	default:
-		return "", fmt.Errorf("unsupported payload.tool %q", tool)
-	}
 }
 
 func decodeJSON(
