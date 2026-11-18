@@ -134,3 +134,5 @@
   - Сделать git commit: `docs: update architecture and add operations, deployment, and testing guides`
 
 - [x] **T17: Проверять payload в PostgreSQL до постановки задания в очередь.** Миграция `000004` вводит проверку в `sm_create_input` для `echo-test`, `yt-dlp`, `fabric`; отсутствие `message` сохраняет `default echo`. Неверный payload → SQLSTATE `22023` → HTTP 400, без создания input/process/job. Приёмка: SQL/HTTP regression, обратимость `up → down → up`, quality gate. План: `.opencode/tasks/17_todo_entry.md`.
+
+- [x] **T18: Сохранить опрос очереди при потере LISTEN.** Worker журналирует потерю подписки и продолжает публиковать pending-задания по `POLL_INTERVAL`. Попытки reconnect идут по одной, с паузой 1 с после ошибки. Приёмка: один ERROR на эпизод потери, файл опубликован до восстановления, после него работают уведомления; штатная отмена без ложной тревоги; race-тесты и quality gate.

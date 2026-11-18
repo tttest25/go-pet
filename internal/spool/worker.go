@@ -23,10 +23,6 @@ type SpoolWorker struct {
 	logger       *slog.Logger
 }
 
-type notificationResult struct {
-	err error
-}
-
 func NewWorker(
 	database *db.DB,
 	writer *SpoolWriter,
@@ -76,13 +72,34 @@ func (w *SpoolWorker) Run(ctx context.Context) error {
 	ticker := time.NewTicker(w.pollInterval)
 	defer ticker.Stop()
 
-	waitResults := make(chan notificationResult, 1)
+	queueWake := make(chan struct{})
 	startWait := func() {
 		waitGroup.Add(1)
 		go func() {
 			defer waitGroup.Done()
+			if runCtx.Err() != nil {
+				return
+			}
 			_, err := w.queue.WaitForNotification(runCtx)
-			waitResults <- notificationResult{err: err}
+			if runCtx.Err() != nil {
+				return
+			}
+			if err != nil {
+				w.logger.Error(
+					"spool listener connection lost; reconnecting",
+					"channel", "sm_jobs_channel",
+					"error", err,
+				)
+				// Recover here, leaving the dispatcher free to service the ticker.
+				if err := w.reconnectListener(runCtx); err != nil {
+					return
+				}
+			}
+			// Both a notification and a restored subscription require a drain.
+			select {
+			case queueWake <- struct{}{}:
+			case <-runCtx.Done():
+			}
 		}()
 	}
 	startWait()
@@ -98,22 +115,9 @@ func (w *SpoolWorker) Run(ctx context.Context) error {
 				}
 				return err
 			}
-		case result := <-waitResults:
-			if result.err != nil {
-				if runCtx.Err() != nil {
-					return nil
-				}
-
-				w.logger.Error(
-					"spool listener connection lost; reconnecting",
-					"error", result.err,
-				)
-				if err := w.reconnectListener(runCtx); err != nil {
-					if runCtx.Err() != nil {
-						return nil
-					}
-					return fmt.Errorf("reconnect spool listener: %w", err)
-				}
+		case <-queueWake:
+			if runCtx.Err() != nil {
+				return nil
 			}
 
 			if err := w.dispatchPending(runCtx); err != nil {
@@ -148,24 +152,22 @@ func (w *SpoolWorker) dispatchPending(ctx context.Context) error {
 
 func (w *SpoolWorker) reconnectListener(ctx context.Context) error {
 	for {
-		if err := w.queue.ReconnectListener(ctx); err == nil {
-			return nil
-		} else {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			w.logger.Error("reconnect spool listener failed", "error", err)
+		if err := ctx.Err(); err != nil {
+			return err
 		}
+		err := w.queue.ReconnectListener(ctx)
+		if err == nil {
+			return nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		w.logger.Error("reconnect spool listener failed", "error", err)
 
 		timer := time.NewTimer(time.Second)
 		select {
 		case <-ctx.Done():
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
+			timer.Stop()
 			return ctx.Err()
 		case <-timer.C:
 		}
