@@ -239,23 +239,27 @@ Worker выгружает все pending на старте, затем проб�
 ошибка writer останавливает worker/приложение, автоматического requeue нет.
 Это не обещание exactly-once или полной crash-durability файлового протокола.
 
-Runner сканирует только `in/*.json`, перемещает файл в `processing`, отправляет
-in_progress, выполняет CLI, затем отправляет completed/failed и удаляет файл задания
-при успешном прохождении callback. Ошибки могут оставить processing и остановить runner.
-Автовозобновления `processing/*.json` нет. Без аргументов — один проход,
-с `--loop` — проходы с паузой 2 секунды. Конфигурация runner:
-`SPOOL_DIR`, `API_BASE_URL` и окружение `PATH`/CLI.
+Runner держит неблокирующую блокировку `.runner.lock` на один spool и сканирует
+только `in/*.json`. Он переносит файл в `processing` без перезаписи,
+проверяет JSON и UUID, отправляет in_progress, проверяет аргументы и выполняет
+инструмент. Файл удаляется только после подтверждённого completed/failed.
+Только HTTP 204 при успешном `curl` подтверждает callback; лимиты подключения
+и запроса — 3 и 10 с, без редиректов и повтора. При неподтверждённом callback
+runner останавливается, оставляет файл и доступные артефакты; БД могла уже
+применить переход. Автовозобновления `processing/*.json` нет.
+Без аргументов — один проход, с `--loop` — проходы с паузой 2 секунды.
+Конфигурация: `SPOOL_DIR`, `API_BASE_URL`, `RUNNER_TOOL_TIMEOUT` и `PATH`/CLI.
 
 | Инструмент | Реальное поведение |
 | --- | --- |
 | `echo-test` | `payload.message` (default `default echo`) → `result.json` с `status:"ok",echo` |
-| `yt-dlp` | Требует `payload.url`, запускает `yt-dlp --dump-json` → метаданные в `result.json`; не скачивает аудио и не делает транскрипцию |
-| `fabric` | `payload.text`, `payload.pattern` (default `summarize`) → `fabric --pattern`, `output.md` и `result.json` с `pattern,output_path` |
+| `yt-dlp` | `yt-dlp --dump-json -- "$url"` → метаданные в `result.json`; не скачивает аудио и не делает транскрипцию |
+| `fabric` | `payload.text` через stdin, `fabric --pattern "$pattern"` (default `summarize`) → `output.md`, при успехе также `result.json` с `pattern,output_path` |
 
-Если `yt-dlp` или `fabric` отсутствует в PATH, runner пишет simulated-результат с
-`warning` и **может успешно завершить задачу**. Для реальной обработки CLI должны быть
-установлены и настроены. Связка yt-dlp + fabric сейчас — два input/процесса,
-соединённые оператором, не автоматический конвейер.
+Отсутствие CLI, ошибка или таймаут → `failed`. Внешний CLI ограничен GNU `timeout`:
+по умолчанию 300 с, затем 1 с grace до KILL. Stderr записывается отдельно в
+`out/<job_id>/stderr.log`; при ошибке сохраняется доступный вывод. Связка yt-dlp +
+fabric — два input/процесса, соединённые оператором, не автоматический конвейер.
 
 ## 6. HTTP-контракты и наблюдаемость
 

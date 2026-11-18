@@ -138,3 +138,5 @@
 - [x] **T17: Проверять payload в PostgreSQL до постановки задания в очередь.** Миграция `000004` вводит проверку в `sm_create_input` для `echo-test`, `yt-dlp`, `fabric`; отсутствие `message` сохраняет `default echo`. Неверный payload → SQLSTATE `22023` → HTTP 400, без создания input/process/job. Приёмка: SQL/HTTP regression, обратимость `up → down → up`, quality gate. План: `.opencode/tasks/17_todo_entry.md`.
 
 - [x] **T18: Сохранить опрос очереди при потере LISTEN.** Worker журналирует потерю подписки и продолжает публиковать pending-задания по `POLL_INTERVAL`. Попытки reconnect идут по одной, с паузой 1 с после ошибки. Приёмка: один ERROR на эпизод потери, файл опубликован до восстановления, после него работают уведомления; штатная отмена без ложной тревоги; race-тесты и quality gate.
+
+- [x] **T20: Исключить ложный успех хостового runner.** Нет CLI, nonzero или timeout → `failed`; только HTTP 204 подтверждает callback, иначе `processing` сохраняется для сверки БД. Приёмка: Go harness проверяет argv/stdin, артефакты, ошибки callback, UUID и flock; race и quality gate. План: `.opencode/tasks/20_spool_runner_hardening.md`.

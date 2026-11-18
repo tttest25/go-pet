@@ -6,35 +6,86 @@ IN_DIR="$SPOOL_DIR/in"
 PROCESSING_DIR="$SPOOL_DIR/processing"
 OUT_DIR="$SPOOL_DIR/out"
 API_BASE_URL="${API_BASE_URL:-http://127.0.0.1:8080/api/v1}"
+RUNNER_TOOL_TIMEOUT="${RUNNER_TOOL_TIMEOUT-300}"
 
-for cmd in jq curl; do
+if [[ ! "$RUNNER_TOOL_TIMEOUT" =~ ^[1-9][0-9]{0,4}$ ]] || (( RUNNER_TOOL_TIMEOUT > 86400 )); then
+    echo "Error: RUNNER_TOOL_TIMEOUT must be an integer from 1 to 86400 seconds." >&2
+    exit 1
+fi
+
+for cmd in jq curl timeout flock mkdir mv rm sleep; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "Error: required tool '$cmd' is not installed." >&2
         exit 1
     fi
 done
+if [[ "$(timeout --version 2>/dev/null)" != 'timeout (GNU coreutils)'* ]]; then
+    echo "Error: GNU coreutils timeout is required." >&2
+    exit 1
+fi
 
 mkdir -p "$IN_DIR" "$PROCESSING_DIR" "$OUT_DIR"
+
+# Never remove this file: competing runners must lock the same inode.
+exec {lock_fd}>>"$SPOOL_DIR/.runner.lock"
+if ! flock -n "$lock_fd"; then
+    echo "Error: cannot acquire spool lock; another runner may be active." >&2
+    exit 1
+fi
 
 send_status() {
     local job_id="$1"
     local status="$2"
     local json_body="$3"
 
-    local response
-    local http_code
-
-    response=$(curl -s -w "\n%{http_code}" -X POST \
+    local http_code reason
+    if http_code=$(curl -q -s --connect-timeout 3 --max-time 10 \
+        -o /dev/null -w '%{http_code}' -X POST \
         -H "Content-Type: application/json" \
         -d "$json_body" \
-        "$API_BASE_URL/jobs/$job_id/status")
-
-    http_code=$(echo "$response" | tail -n1)
-    
-    if [[ "$http_code" -ge 400 ]]; then
-        echo "Warning: failed to update job $job_id status $status (HTTP $http_code)" >&2
-        return 1
+        "$API_BASE_URL/jobs/$job_id/status" 2>/dev/null); then
+        [[ "$http_code" == 204 ]] && return 0
+        reason="expected HTTP 204"
+    else
+        reason="curl exit $?"
     fi
+    printf 'Error: job %s callback %s unconfirmed (%s); check the database before manual recovery.\n' \
+        "$job_id" "$status" "$reason" >&2
+    return 1
+}
+
+run_tool() {
+    local stderr_path="$1"
+    shift
+    # Bash may report SIGKILL of timeout itself; keep it out of the tool's stderr.
+    # External tools and their descendants must not retain the runner's lock.
+    { timeout --kill-after=1s "${RUNNER_TOOL_TIMEOUT}s" "$@" 2>"$stderr_path" {lock_fd}>&-; } 2>/dev/null
+}
+
+validated_tool() {
+    # The SQL validator remains authoritative; reject malformed spool arguments
+    # before Bash converts them to strings or passes them to a CLI.
+    jq -er '
+        def matches($re): type == "string" and test($re);
+        def nonblank: matches("[^[:space:]]");
+        def http_url:
+            type == "string"
+            and (test("[[:space:][:cntrl:]\\\\]|%(?![0-9A-Fa-f]{2})") | not)
+            and test("\\A(?i:https?)://([A-Za-z0-9._~%!$&\u0027()*+,;=:-]*@)?([A-Za-z0-9._~%!$&\u0027()*+,;=-]+|\\[[A-Fa-f0-9:.]*:[A-Fa-f0-9:.]*(%25([A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+)?\\])(:[0-9]*)?([/?#]|\\z)");
+        .tool_name as $tool
+        | .payload
+        | select(type == "object" and .tool == $tool)
+        | select(
+            if $tool == "echo-test" then
+                (has("message") | not) or (.message | nonblank)
+            elif $tool == "yt-dlp" then
+                .url | http_url
+            elif $tool == "fabric" then
+                (.text | nonblank) and
+                ((has("pattern") | not) or (.pattern | matches("\\A[A-Za-z0-9_-]{1,128}\\z")))
+            else false end
+        ) | $tool
+    ' "$1" 2>/dev/null
 }
 
 process_job() {
@@ -44,96 +95,105 @@ process_job() {
     local job_out_dir
     local result_path
 
-    job_id=$(jq -r '.id' "$json_file")
-    tool_name=$(jq -r '.tool_name' "$json_file")
-
-    if [[ -z "$job_id" || "$job_id" == "null" ]]; then
-        echo "Error: invalid job JSON file (missing id): $json_file" >&2
-        rm -f "$json_file"
+    if ! job_id=$(jq -ers '
+        select(length == 1) | .[0] | select(type == "object") | .id
+        | select(type == "string" and test("\\A[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\\z"))
+    ' "$json_file" 2>/dev/null); then
+        printf 'Error: invalid job JSON or UUID; retained %q for inspection.\n' "$json_file" >&2
         return 1
     fi
 
-    echo "Processing job $job_id (tool: $tool_name)..."
+    echo "Processing job $job_id..."
 
     if ! send_status "$job_id" "in_progress" '{"status":"in_progress"}'; then
-        echo "Failed to mark job $job_id as in_progress, skipping." >&2
         return 1
     fi
-
-    job_out_dir="$OUT_DIR/$job_id"
-    mkdir -p "$job_out_dir"
 
     local exec_status=0
     local error_msg=""
 
+    if tool_name=$(validated_tool "$json_file"); then
+        job_out_dir="$OUT_DIR/$job_id"
+        mkdir -p "$job_out_dir"
+        result_path="$job_out_dir/result.json"
+    fi
+
     case "$tool_name" in
         echo-test)
-            result_path="$job_out_dir/result.json"
-            local message
-            message=$(jq -r '.payload.message // "default echo"' "$json_file")
-            jq -n --arg msg "$message" '{"status":"ok","echo":$msg}' > "$result_path"
+            jq '{"status":"ok","echo":(.payload.message // "default echo")}' "$json_file" > "$result_path" 2>/dev/null
             ;;
         yt-dlp)
-            result_path="$job_out_dir/result.json"
-            local url
-            url=$(jq -r '.payload.url // empty' "$json_file")
-            if [[ -z "$url" ]]; then
-                exec_status=1
-                error_msg="yt-dlp: missing payload.url"
+            if command -v yt-dlp &>/dev/null; then
+                local url
+                url=$(jq -r '.payload.url' "$json_file" 2>/dev/null)
+                run_tool "$job_out_dir/stderr.log" yt-dlp --dump-json -- "$url" > "$result_path" || exec_status=$?
             else
-                if command -v yt-dlp &>/dev/null; then
-                    yt-dlp --dump-json "$url" > "$result_path" || exec_status=$?
-                else
-                    jq -n --arg u "$url" '{"warning":"yt-dlp CLI not found, simulated","url":$u}' > "$result_path"
-                fi
+                exec_status=1
+                error_msg="yt-dlp CLI not found"
             fi
             ;;
         fabric)
-            result_path="$job_out_dir/result.json"
-            local pattern
-            pattern=$(jq -r '.payload.pattern // "summarize"' "$json_file")
-            local text
-            text=$(jq -r '.payload.text // "empty text"' "$json_file")
             if command -v fabric &>/dev/null; then
-                echo "$text" | fabric --pattern "$pattern" > "$job_out_dir/output.md" || exec_status=$?
-                jq -n --arg p "$pattern" --arg path "$job_out_dir/output.md" '{"pattern":$p,"output_path":$path}' > "$result_path"
+                local pattern
+                local -a pipeline_status
+                pattern=$(jq -r '.payload.pattern // "summarize"' "$json_file" 2>/dev/null)
+                if jq -j '.payload.text' "$json_file" 2>/dev/null |
+                    run_tool "$job_out_dir/stderr.log" fabric --pattern "$pattern" > "$job_out_dir/output.md"; then
+                    jq -n --arg p "$pattern" --arg path "$job_out_dir/output.md" \
+                        '{"pattern":$p,"output_path":$path}' > "$result_path"
+                else
+                    pipeline_status=("${PIPESTATUS[@]}")
+                    exec_status=${pipeline_status[1]}
+                    if [[ $exec_status -eq 0 ]]; then
+                        exec_status=${pipeline_status[0]}
+                        error_msg="fabric: could not deliver payload.text"
+                    fi
+                fi
             else
-                jq -n --arg p "$pattern" --arg t "$text" '{"warning":"fabric CLI not found, simulated","pattern":$p,"text":$t}' > "$result_path"
+                exec_status=1
+                error_msg="fabric CLI not found"
             fi
             ;;
         *)
             exec_status=1
-            error_msg="Unknown tool_name: $tool_name"
+            error_msg="Invalid job tool or payload"
             ;;
     esac
 
     if [[ $exec_status -eq 0 ]]; then
         local body
         body=$(jq -n --arg path "/spool/out/$job_id/result.json" '{"status":"completed","result_path":$path}')
-        send_status "$job_id" "completed" "$body"
+        send_status "$job_id" "completed" "$body" || return 1
         echo "Job $job_id completed successfully."
     else
-        [[ -z "$error_msg" ]] && error_msg="Tool $tool_name exited with code $exec_status"
+        if [[ -z "$error_msg" ]]; then
+            case "$exec_status" in
+                124|137) error_msg="Tool $tool_name timed out or was killed (code $exec_status)" ;;
+                *) error_msg="Tool $tool_name exited with code $exec_status" ;;
+            esac
+        fi
         local body
         body=$(jq -n --arg err "$error_msg" '{"status":"failed","error_msg":$err}')
-        send_status "$job_id" "failed" "$body"
+        send_status "$job_id" "failed" "$body" || return 1
         echo "Job $job_id failed: $error_msg" >&2
     fi
 
-    rm -f "$json_file"
+    rm -f -- "$json_file"
 }
 
 run_once() {
     local file
     for file in "$IN_DIR"/*.json; do
-        [[ -e "$file" ]] || continue
-        local filename
-        filename=$(basename "$file")
-        local processing_file="$PROCESSING_DIR/$filename"
+        [[ -e "$file" || -L "$file" ]] || continue
+        local processing_file="$PROCESSING_DIR/${file##*/}"
 
-        if mv "$file" "$processing_file" 2>/dev/null; then
-            process_job "$processing_file"
+        if ! mv -T -n -- "$file" "$processing_file" ||
+            [[ -e "$file" || -L "$file" ]]; then
+            printf 'Error: cannot claim %q without replacing %q; check the spool and database.\n' \
+                "$file" "$processing_file" >&2
+            return 1
         fi
+        process_job "$processing_file"
     done
 }
 
@@ -141,7 +201,7 @@ if [[ "${1:-}" == "--loop" ]]; then
     echo "Starting spool-runner in daemon mode..."
     while true; do
         run_once
-        sleep 2
+        sleep 2 {lock_fd}>&-
     done
 else
     run_once

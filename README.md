@@ -176,6 +176,8 @@ Unit создаёт **оператор**, не приложение. Приме�
 непривилегированного пользователя, а не вымышленную учётную запись `petar`.
 Сначала настройте права из раздела выше, HOME, CLI и конфигурацию fabric.
 Команды рассчитаны на обычные имена/пути без пробелов и кавычек.
+На хосте runner нужны Bash, `jq`, `curl`, GNU coreutils (включая `timeout`)
+и `flock` из util-linux. `yt-dlp` и `fabric` нужны для заданий соответствующих типов.
 
 ```bash
 set -euo pipefail
@@ -183,7 +185,7 @@ test "$(id -u)" -eq 1000
 RUNNER_USER="$(id -un)"
 RUNNER_HOME="$(getent passwd "$RUNNER_USER" | cut -d: -f6)"
 RUNNER_PATH="$RUNNER_HOME/.local/bin:$RUNNER_HOME/go/bin:/usr/local/bin:/usr/bin:/bin"
-env HOME="$RUNNER_HOME" PATH="$RUNNER_PATH" bash -c 'command -v jq curl; command -v yt-dlp fabric'
+env HOME="$RUNNER_HOME" PATH="$RUNNER_PATH" bash -c 'command -v jq curl timeout flock yt-dlp fabric'
 sudo tee /etc/systemd/system/petar-spool-runner.service >/dev/null <<EOF
 [Unit]
 Description=petar host spool runner
@@ -214,9 +216,21 @@ sudo systemctl status petar-spool-runner.service --no-pager
 sudo journalctl -u petar-spool-runner.service -f
 ```
 
-`After=` задаёт порядок, не готовность API. Без доступного API задача может
-остаться в `processing`. Runner сканирует только `in/*.json`, сам не возобновляет
-`processing/*.json`. Без установленных CLI yt-dlp/fabric создают simulated success!
+`After=` задаёт порядок, не готовность API. Runner обрабатывает только `in/*.json`:
+без аргументов — один проход, с `--loop` — повторные проходы. На один `SPOOL_DIR`
+допускается один runner: второй сразу завершится с ошибкой блокировки. Не удаляйте
+постоянный файл `.runner.lock`. Оставшиеся `processing/*.json` не возобновляются
+даже при рестарте unit.
+
+Каждый callback ограничен 3 с на подключение и 10 с на весь запрос. Только
+HTTP 204 при успешном завершении `curl` подтверждает статус; редиректы и повторные POST
+не выполняются. При неподтверждённом статусе runner завершится с ошибкой и оставит
+файл в `processing` для сверки по job ID.
+
+Для `yt-dlp` и `fabric` `RUNNER_TOOL_TIMEOUT` задаёт целое число секунд от 1 до
+86400 (по умолчанию 300); после TERM даётся ещё 1 с до KILL. Нет CLI, ненулевой
+код или таймаут → `failed`, а не `completed`. Подтверждённый `failed` не считается
+сбоем runner. Невалидное значение таймаута отклоняется до захвата заданий.
 
 ```bash
 sudo systemctl stop petar-spool-runner.service
@@ -614,10 +628,6 @@ YTDLP_DETAILS="$(wait_process "$YTDLP_PROCESS")"
 YTDLP_JOB="$(jq -er '.jobs[0].id' <<<"$YTDLP_DETAILS")"
 META="/opt/go-pet/spool/out/$YTDLP_JOB/result.json"
 jq . "$META"
-if jq -s -e 'any(.[]; (.warning // "" | contains("simulated")))' "$META"; then
-  echo 'Simulated yt-dlp: установите CLI в окружении runner' >&2
-  exit 1
-fi
 # Только доступные title/description, НЕ транскрипт. Максимум 16k символов.
 TEXT="$(jq -sr 'map([.title // "", .description // ""] | join("\n")) | join("\n") | .[0:16000]' "$META")"
 test -n "$TEXT"
@@ -631,17 +641,15 @@ FABRIC_DETAILS="$(wait_process "$FABRIC_PROCESS")"
 FABRIC_JOB="$(jq -er '.jobs[0].id' <<<"$FABRIC_DETAILS")"
 RESULT="/opt/go-pet/spool/out/$FABRIC_JOB/result.json"
 jq . "$RESULT"
-if jq -e '.warning // "" | contains("simulated")' "$RESULT"; then
-  echo 'Simulated fabric: проверьте CLI/PATH' >&2
-  exit 1
-fi
 cat "/opt/go-pet/spool/out/$FABRIC_JOB/output.md"
 ```
 
-При отсутствующем CLI runner может успешно завершить simulated-задачу;
-для fabric тогда `output.md` не создаётся. Реальный fabric читает `payload.text`,
-запускается с `--pattern payload.pattern`, пишет `output.md` и `result.json`
-(в последнем `output_path` — host path runner).
+Fabric читает `payload.text` через stdin, запускается с `--pattern payload.pattern`
+и пишет stdout в `output.md`; при успехе `result.json` содержит `output_path`
+(host path runner). `yt-dlp` пишет stdout в `result.json`. Stderr обоих CLI
+сохраняется отдельно в `out/<job_id>/stderr.log`, в том числе при ошибке.
+Частичный stdout при `failed` — диагностика, а не подтверждённый результат.
+Артефакты могут содержать чувствительные данные.
 
 ## 4. Operations: аудит и recovery
 
@@ -668,7 +676,12 @@ SQL
 ### Зависшие dispatched/in_progress
 
 Захват БД и публикация файла — не общая транзакция. Сбой после dispatch может
-оставить задачу без файла; сбой callback — с файлом/артефактом и старым статусом.
+оставить задачу без файла. При неподтверждённом callback до ручного решения
+сверьте статус и аудит в БД по job ID (запросы выше), затем проверьте `processing`
+и артефакты: сервер мог применить переход, даже если runner не получил HTTP 204.
+При неподтверждённом `in_progress` CLI не запускается; при сбое терминального
+callback он уже мог выполнить внешнее действие. Не повторяйте POST или CLI
+только на основании ошибки сети или HTTP-кода.
 Exactly-once, lease, автоматического retry и идемпотентности CLI нет.
 15 минут ниже — эвристика оператора, не встроенный timeout.
 
