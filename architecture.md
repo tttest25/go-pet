@@ -92,7 +92,7 @@ PostgreSQL ограничен `mem_limit: 450m`, `max_connections=20`, `io_metho
 │   └── api/                     # net/http ServeMux, JSON, logging middleware
 ├── postgres/                    # Вся инфраструктура и SQL БД
 │   ├── data/                    # Bind mount данных, исключён из Git
-│   ├── migrations/              # Пары up/down: 000001–000004
+│   ├── migrations/              # Пары up/down: 000001–000005
 │   └── postgresql.conf          # PostgreSQL 18, лимиты, io_method
 ├── scripts/
 │   ├── spool-runner.sh          # Хостовый исполнитель
@@ -134,6 +134,7 @@ UUID PK таблиц используют нативную `uuidv7()` PostgreSQL
 | `sm_jobs` | `id,process_id,tool_name,payload,status,priority,result_path,error_msg,created_at,updated_at`; payload default `{}`, priority default 0 |
 | `sm_job_logs` | `id,job_id,old_status,new_status,message,created_at`; message берётся из `NEW.error_msg` |
 | `sm_outputs` | `id,process_id,artifact_type,content,metadata,created_at`; metadata JSONB default `{}`, content nullable |
+| `sm_actions` | Каталог без FK к истории: PK `(action,version)`, `action` с `COLLATE "C"`, версия > 0, непустой `title`, флаг `enabled`. Начальные активные пары: `echo-test`, `fabric`, `yt-dlp`, все v1 |
 
 `tool_name` ограничен `echo-test/yt-dlp/fabric`; статусы задач и процессов показаны ниже.
 `result_path` и `error_msg` nullable. Время хранится как `TIMESTAMPTZ`, по умолчанию `NOW()`.
@@ -143,7 +144,7 @@ UUID PK таблиц используют нативную `uuidv7()` PostgreSQL
 
 | Функция | Контракт |
 | --- | --- |
-| `sm_create_input(p_source,p_payload)` | Вызывает `sm_validate_tool_payload` до вставки, затем создаёт input; возвращает `input_id,process_id,status` |
+| `sm_create_input(p_source,p_payload)` | Вызывает `sm_validate_tool_payload`, проверяет наличие активной пары `(payload.tool,1)` в `sm_actions` и только затем создаёт input; возвращает `input_id,process_id,status` |
 | `sm_pick_next_job()` | Атомарно выбирает pending по `priority DESC,created_at ASC`, `FOR UPDATE SKIP LOCKED`, переводит в dispatched; возвращает `id,process_id,tool_name,payload,old_status,status` |
 | `sm_update_job_status(p_job_id,p_status,p_result_path,p_error_msg)` | Принимает только исходные `dispatched/in_progress` и целевые `in_progress/completed/failed`; возвращает VOID; пустые строки путей/ошибок превращает в NULL |
 
@@ -152,6 +153,9 @@ UUID PK таблиц используют нативную `uuidv7()` PostgreSQL
 Валидация payload — контракт `sm_create_input`, а не новое ограничение триггера
 или таблицы. Прямой INSERT сохраняет прежнее поведение. Миграция `000004`
 не меняет ранее созданные задания; её down восстанавливает прежнее тело функции.
+`000005` добавляет проверку доступности только в `sm_create_input`; отключение
+не меняет существующую очередь и историю. Её down сохраняет валидацию `000004`,
+но удаляет каталог вместе с настройками доступности.
 `trg_sm_jobs_notify` вызывает `pg_notify('sm_jobs_channel', NEW.id::text)` при INSERT pending
 или изменении статуса на pending. Уведомление доставляется после COMMIT.
 `trg_sm_jobs_status_audit` срабатывает только при фактическом изменении статуса,
@@ -299,7 +303,8 @@ readiness сохраняет JSON 503. Отмена клиентом и обыч
 `default echo`); `yt-dlp.url` — абсолютный HTTP(S) URL с host; `fabric.text` —
 непустая строка, необязательный `pattern` — `[A-Za-z0-9_-]{1,128}` (по умолчанию
 `summarize`). Явный `null` не заменяет отсутствующее поле. Строки и дополнительные
-поля не переписываются. Неверный payload даёт SQLSTATE `22023` → HTTP 400
+поля не переписываются. Неверный payload или отсутствие активной версии 1
+в каталоге даёт SQLSTATE `22023` → HTTP 400
 без вставок; остальные ошибки создания в БД дают HTTP 500.
 
 Ответ содержит `input_id,process_id,status:"new",id`; легаси `id` равен `input_id`,
@@ -371,9 +376,9 @@ Liveness не проверяет БД; readiness проверяет её дос�
 - DB backup не включает spool и серверные роли; согласованный backup и restore
   требуют отдельного сохранения файлов и остановки исполнителей.
 - Compose монтирует одновременно `.up.sql` и `.down.sql` в initdb: entrypoint
-  обрабатывает SQL по имени, а не по смыслу миграции. На чистом PGDATA с 18.6
-  текущий набор файлов дал готовую схему и успешный откатываемый `sm_create_input`;
-  это не гарантия для другого набора файлов. Initdb не повторяется при рестарте.
+  обрабатывает SQL по имени, а не по смыслу миграции. Проверка свежего bootstrap
+  на чистом PGDATA требует готовую схему, три активные пары каталога v1 и
+  успешный откатываемый `sm_create_input`. Initdb не повторяется при рестарте.
   Bootstrap с проверкой объектов и явным порядком up описан в README;
   `000002` не идемпотентна.
 - SIGINT/SIGTERM запускают graceful shutdown HTTP (до 10 секунд), остановку worker
@@ -389,5 +394,6 @@ Liveness не проверяет БД; readiness проверяет её дос�
 [state machine](postgres/migrations/000002_create_state_machine.up.sql),
 [stored functions](postgres/migrations/000003_db_state_functions.up.sql),
 [payload validation](postgres/migrations/000004_validate_tool_payload.up.sql),
+[action catalog](postgres/migrations/000005_action_catalog.up.sql),
 [writer](internal/spool/writer.go), [worker](internal/spool/worker.go),
 [runner](scripts/spool-runner.sh), [Compose](docker-compose.yml).

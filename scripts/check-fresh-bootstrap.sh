@@ -58,7 +58,7 @@ SHOW server_version;
 SELECT extname FROM pg_extension ORDER BY extname;
 SELECT srvname FROM pg_foreign_server;
 SELECT to_regclass('sm_inputs'), to_regclass('sm_processes'), to_regclass('sm_jobs'),
-       to_regclass('sm_job_logs'), to_regclass('sm_outputs');
+       to_regclass('sm_job_logs'), to_regclass('sm_outputs'), to_regclass('public.sm_actions');
 SELECT to_regprocedure('sm_create_input(text,jsonb)'),
        to_regprocedure('sm_validate_tool_payload(jsonb)'),
        to_regprocedure('sm_pick_next_job()'),
@@ -72,6 +72,12 @@ SELECT current_setting('server_version_num')::int BETWEEN 180000 AND 189999
    AND to_regclass('public.sm_jobs') IS NOT NULL
    AND to_regclass('public.sm_job_logs') IS NOT NULL
    AND to_regclass('public.sm_outputs') IS NOT NULL
+   AND to_regclass('public.sm_actions') IS NOT NULL
+   AND (SELECT count(*) = 3
+          AND bool_or((action, version) = ('echo-test', 1))
+          AND bool_or((action, version) = ('fabric', 1))
+          AND bool_or((action, version) = ('yt-dlp', 1))
+        FROM public.sm_actions WHERE enabled)
    AND to_regprocedure('public.sm_create_input(text,jsonb)') IS NOT NULL
    AND to_regprocedure('public.sm_validate_tool_payload(jsonb)') IS NOT NULL
    AND to_regprocedure('public.sm_pick_next_job()') IS NOT NULL

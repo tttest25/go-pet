@@ -96,7 +96,7 @@ Entrypoint выполняет SQL по имени, не понимая up/down: 
 схемы после одного `up`. На существующем data dir initdb повторно не запускается.
 Никогда не удаляйте `postgres/data` ради повторного bootstrap.
 
-**Наблюдение T21:** на PostgreSQL 18.6 текущие восемь файлов (down перед up
+**Наблюдение T21:** на PostgreSQL 18.6 восемь файлов `000001`–`000004` (down перед up
 для каждой пары) успешно отработали в пустом PGDATA. Финальный TCP-сервер
 поднялся; найдены три расширения, `dokuwiki_files`, пять таблиц, четыре SQL-функции
 и три включённых триггера. Пробный `sm_create_input` создал одну pending-задачу
@@ -105,7 +105,8 @@ Entrypoint выполняет SQL по имени, не понимая up/down: 
 тот же образ, конфиг, команду и read-only mount миграций, но собственный каталог
 под `postgres/`, без опубликованных портов и без restart loop. Он выводит состояние
 контейнера и логи initdb; `FRESH BOOTSTRAP PASSED` означает, что прошли проверки
-схемы и пробной вставки, не только проверка доступности сервера.
+схемы и пробной вставки, не только проверка доступности сервера. Начиная с
+`000005`, проверка также требует таблицу каталога и три точные активные пары v1.
 
 ```bash
 cd /opt/go-pet
@@ -116,7 +117,7 @@ docker exec -i petar_postgres psql -U petar_user -d petar_db -v ON_ERROR_STOP=1 
 SELECT extname FROM pg_extension ORDER BY extname;
 SELECT srvname FROM pg_foreign_server;
 SELECT to_regclass('sm_inputs'), to_regclass('sm_processes'), to_regclass('sm_jobs'),
-       to_regclass('sm_job_logs'), to_regclass('sm_outputs');
+       to_regclass('sm_job_logs'), to_regclass('sm_outputs'), to_regclass('public.sm_actions');
 SELECT to_regprocedure('sm_create_input(text,jsonb)'),
        to_regprocedure('sm_validate_tool_payload(jsonb)'),
        to_regprocedure('sm_pick_next_job()'),
@@ -124,10 +125,15 @@ SELECT to_regprocedure('sm_create_input(text,jsonb)'),
 SQL
 ```
 
+На свежей схеме после `000005` запрос `SELECT action, version FROM
+public.sm_actions WHERE enabled ORDER BY action, version;` должен вернуть
+`echo-test`, `fabric`, `yt-dlp` (все версии 1). В уже используемом каталоге
+отключённые записи допустимы.
+
 Существующая БД: при наличии объектов не повторять `000002` — она не идемпотентна.
 Пустое окружение: после завершения initdb проверьте результаты выше и логи.
 Следующая функция позволяет **явно** применить только недостающие up-файлы
-в порядке 000001 → 000002 → 000003 → 000004; выполняйте соответствующие вызовы лишь
+в порядке 000001 → 000002 → 000003 → 000004 → 000005; выполняйте соответствующие вызовы лишь
 после проверки, не все автоматически:
 
 ```bash
@@ -144,6 +150,8 @@ apply_up() {
 # apply_up 000003_db_state_functions.up.sql
 # Если база уже на 000003, но нет sm_validate_tool_payload:
 # apply_up 000004_validate_tool_payload.up.sql
+# Если база уже на 000004, но нет public.sm_actions:
+# apply_up 000005_action_catalog.up.sql
 ```
 
 `000001` использует IF NOT EXISTS, `000003` — CREATE OR REPLACE.
@@ -158,6 +166,13 @@ apply_up() {
 payload. Для отката используйте `000004_validate_tool_payload.down.sql` и
 прежнюю версию приложения в том же окне остановленного приёма. Откат восстанавливает
 прежнее тело `sm_create_input`; он не удаляет записи и не переобрабатывает очередь.
+
+При обновлении с `000004` приостановите приём новых input, подтвердите схему
+`000004` и отсутствие `public.sm_actions`, примените только
+`000005_action_catalog.up.sql`, затем проверьте каталог и возобновите приём.
+Откат через `000005_action_catalog.down.sql` восстанавливает валидатор в
+штатном пути `sm_create_input`, но удаляет каталог и его настройки доступности.
+Очередь и история не изменяются.
 
 ### Старт приложения
 
@@ -906,12 +921,24 @@ GOFLAGS='-count=1' ./scripts/quality-gate.sh
 
 `prepare` создаёт отсутствующую `petar_test`, ставит комментарий
 `petar:test-db:lifecycle=v1;state=preparing`, применяет только up
-000001 → 000002 → 000003 → 000004 и после проверки схемы ставит `state=ready`.
+000001 → 000002 → 000003 → 000004 → 000005 и после проверки схемы ставит `state=ready`.
 Повторный prepare готовой БД только проверяет её, не повторяет 000002.
 На уже готовой `petar_test` с `000003` `prepare` и `check` сообщат об отсутствии
-валидатора, не обновляя схему автоматически. Для обновления без reset сначала
-проверьте цель и её принадлежность тестовому lifecycle, затем примените только
-`000004.up` к этой БД под общим `flock` и повторите `check`.
+обязательных объектов, не обновляя схему автоматически. Для обновления без reset
+подтвердите цель и baseline, примените `000004.up` под общим `flock`, затем
+выполните шаг обновления до `000005` ниже.
+Для готовой `petar_test` на `000004` не используйте reset и не повторяйте старые
+миграции. Подтвердите локальную цель `petar_postgres` / `petar_user` / `petar_test`,
+PostgreSQL 18, ready-маркер, схему `000004`, отсутствие `public.sm_actions`
+и других подключений к `petar_test`. Примените только:
+
+```bash
+flock -x /opt/go-pet/postgres/.petar-test-db.lock \
+  docker exec -i petar_postgres psql -X -1 -v ON_ERROR_STOP=1 -U petar_user -d petar_test \
+  < postgres/migrations/000005_action_catalog.up.sql
+./scripts/test-db.sh check
+```
+
 Существующая БД без маркера не «усыновляется»; частичная подготовка требует
 отдельного явного reset. Маркер защищает от случайного удаления, не от атак.
 
@@ -1072,5 +1099,26 @@ input с задачей. Выполните `000004.up → 000004.down → 00000
 новый `{"tool":"fabric"}` через `sm_create_input` должен дать соответственно
 SQLSTATE `22023`, успешный ответ, снова `22023`. Контрольные ID должны
 сохраниться на всех трёх шагах.
+
+Для отдельной проверки `000005` создайте новую одноразовую БД тем же способом
+и примените только `000001`–`000004.up` по порядку. Создайте и зафиксируйте
+контрольный echo, завершите его задачу через `sm_update_job_status` после
+диспетчеризации и сохраните ID и снимок input, process, job, аудита и output.
+Затем, используя `migration` выше:
+
+1. `migration 000005_action_catalog.up.sql`: проверьте три активные пары v1.
+   Отключите `echo-test` v1 и убедитесь, что новый валидный echo отклоняется
+   с `22023`, не создавая строк.
+2. `migration 000005_action_catalog.down.sql`: `to_regclass('public.sm_actions')`
+   возвращает `NULL`. Валидный echo снова принимается, но `message: null`
+   по-прежнему даёт `22023`. Успешную пробу можно выполнить с `ROLLBACK`.
+3. `migration 000005_action_catalog.up.sql`: снова три активные пары v1;
+   отключение `echo-test` v1 снова блокирует ввод. Up восстанавливает seed,
+   а не настройки, удалённые при down.
+
+Сравните сохранённые строки по исходным ID после каждого перехода. После
+каждого ожидаемого отказа проверьте отсутствие input с источником пробы и
+неизменность количества input/process/job. Удалите только свою одноразовую БД.
+
 Проверки внешних systemd, proxy, DokuWiki и реальных CLI требуют отдельного
 deployment-окружения; наличие примеров в README не означает, что они установлены.
