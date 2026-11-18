@@ -1,7 +1,7 @@
 {
   "$schema": "https://opencode.ai",
 
-  "model": "google/gemini-3.1-flash-lite",
+  "model": "openai/gpt-6.1-sol-fast",
 
   "instructions": [
     "rules.md",
@@ -17,6 +17,7 @@
       ".git/**",
       ".opencode/cache/**",
       ".opencode/sessions/**",
+      ".opencode/*.json_*",
       "petar",
       "*.log",
       "project_bundle*.txt"
@@ -57,46 +58,28 @@
       "models": {
         "gemini-4-hydrogen": {
           "name": "Google Gemini 4 Hydrogen",
-          "cost": {
-            "input": 0,
-            "output": 0
-          },
-          "limit": {
-            "context": 1048576,
-            "output": 65536
-          }
+          "cost": { "input": 0, "output": 0 },
+          "limit": { "context": 1048576, "output": 65536 }
         },
         "gemini-3.8-flash": {
           "name": "Google Gemini 3.8 Flash",
-          "cost": {
-            "input": 0,
-            "output": 0
-          },
-          "limit": {
-            "context": 1048576,
-            "output": 65536
-          }
+          "cost": { "input": 0, "output": 0 },
+          "limit": { "context": 1048576, "output": 65536 }
+        },
+        "gemini-3.6-flash": {
+          "name": "Google Gemini 3.6 Flash",
+          "cost": { "input": 0, "output": 0 },
+          "limit": { "context": 1048576, "output": 65536 }
+        },
+        "gemini-3-flash": {
+          "name": "Google Gemini 3 Flash",
+          "cost": { "input": 0, "output": 0 },
+          "limit": { "context": 1048576, "output": 65536 }
         },
         "gemini-3.1-flash-lite": {
           "name": "Google Gemini 3.1 Flash-Lite",
-          "cost": {
-            "input": 0,
-            "output": 0
-          },
-          "limit": {
-            "context": 1048576,
-            "output": 65536
-          }
-        },
-        "gemini-3.6-flash": {
-                  "name": "Google Gemini 3.6 Flash",
-                  "cost": { "input": 0, "output": 0 },
-                  "limit": { "context": 1048576, "output": 65536 }
-        },
-        "gemini-3-flash": {
-                  "name": "Google Gemini 3 Flash",
-                  "cost": { "input": 0, "output": 0 },
-                  "limit": { "context": 1048576, "output": 65536 }
+          "cost": { "input": 0, "output": 0 },
+          "limit": { "context": 1048576, "output": 65536 }
         }
       }
     },
@@ -106,37 +89,31 @@
       "models": {
         "k3.1-pro": {
           "name": "Moonshot AI Kimi K3.1 Pro",
-          "cost": {
-            "input": 0,
-            "output": 0
-          },
-          "limit": {
-            "context": 200000,
-            "output": 16384
-          }
+          "cost": { "input": 0, "output": 0 },
+          "limit": { "context": 200000, "output": 16384 }
         },
         "k3.1-pro-highspeed": {
           "name": "Moonshot AI Kimi K3.1 Pro Highspeed",
-          "cost": {
-            "input": 0,
-            "output": 0
-          },
-          "limit": {
-            "context": 200000,
-            "output": 16384
-          }
+          "cost": { "input": 0, "output": 0 },
+          "limit": { "context": 200000, "output": 16384 }
         }
       }
     }
   },
 
   "agents": {
+    "title": {
+      "model": "local/gemini-quick-answers"
+    },
+    "summary": {
+      "model": "local/gemini-quick-answers"
+    },
 
     "architect": {
-      "description": "Архитектор на Google Gemini 4 Hydrogen (20 RPD). Пишет ТЗ в .opencode/tasks/ за 1-2 запроса.",
+      "description": "Архитектор на OpenAI GPT-6 Astra (глубокое проектирование, резерв: google/gemini-4-hydrogen). Пишет ТЗ за 1-2 запроса.",
       "mode": "primary",
-      "model": "google/gemini-4-hydrogen",
-      "system": "ВНИМАНИЕ: Лимит модели — 20 запросов в день! Инструменты glob и grep отключены. Прочитай целевые файлы по точным путям за один шаг и сразу запиши детальное ТЗ (с точными кусками кода/SQL) в .opencode/tasks/XX_name.md, чтобы его смогла легко реализовать модель Lite-уровня.",
+      "model": "openai/gpt-6-astra",
+      "system": "ВНИМАНИЕ: Инструменты glob и grep отключены. Прочитай целевые файлы по точным путям за один шаг и сразу запиши детальное ТЗ (с точными кусками кода/SQL) в .opencode/tasks/XX_name.md, чтобы его смогла легко реализовать быстрая модель.",
       "permissions": [
         { "action": "read", "resource": "*", "effect": "allow" },
         { "action": "write", "resource": ".opencode/tasks/*.md", "effect": "allow" },
@@ -150,7 +127,7 @@
     },
 
     "architect-kimi": {
-      "description": "Старший архитектор на Moonshot AI Kimi K3.1 Pro (когда кончились 20 RPD Hydrogen или для сложного SQL)",
+      "description": "Резервный архитектор на Moonshot AI Kimi K3.1 Pro (месячный лимит)",
       "mode": "primary",
       "model": "kimi-code-plan-global/k3.1-pro",
       "system": "Ты — главный архитектор проекта petar на лимитированной месячной квоте Moonshot AI. Инструменты glob и grep отключены. Создай самодостаточное ТЗ в .opencode/tasks/ за один проход без лишних вызовов тулов.",
@@ -166,10 +143,14 @@
       ]
     },
 
+    "plan": {
+      "model": "openai/gpt-6.2-astra-fast"
+    },
+
     "build": {
-      "description": "Основной кодер TDD на Google Gemini 3.1 Flash-Lite (500 RPD / 15 RPM)",
+      "description": "Основной кодер TDD на OpenAI GPT-6.2 Sol (резерв: google/gemini-3.1-flash-lite)",
       "mode": "primary",
-      "model": "google/gemini-3.1-flash-lite",
+      "model": "openai/gpt-6.2-sol",
       "system": "Ты — исполнитель TDD проекта petar. Строго следуй готовому ТЗ из .opencode/tasks/. Шаг 1: напиши тест в *_test.go. Шаг 2: напиши код. Шаг 3: запусти ./scripts/quality-gate.sh.",
       "permissions": [
         { "action": "read", "resource": "*", "effect": "allow" },
@@ -189,10 +170,10 @@
     },
 
     "build-heavy": {
-      "description": "Сложный кодинг и фикс гонок на Google Gemini 3.8 Flash (20 RPD). При 429 переключай через /models на 3.6-flash -> 3-flash -> kimi-code-plan-global/k3.1-pro-highspeed",
+      "description": "Сложный кодинг и фикс гонок на OpenAI GPT-6.1 Terra (полный reasoning, резерв: google/gemini-3.8-flash)",
       "mode": "primary",
-      "model": "google/gemini-3.8-flash",
-      "system": "Квота — 20 запросов в день (5 RPM). Не делай лишних чтений! Внеси правки сразу в нужный файл и запусти ровно один раз ./scripts/quality-gate.sh.",
+      "model": "openai/gpt-6.1-terra",
+      "system": "Действуй снайперски: прочитай только проблемный файл, внеси точечную правку и запусти ./scripts/quality-gate.sh.",
       "permissions": [
         { "action": "read", "resource": "*", "effect": "allow" },
         { "action": "write", "resource": "*", "effect": "allow" },
@@ -204,10 +185,10 @@
     },
 
     "review": {
-      "description": "Агент-критик (Bounded Review Loop до 2 итераций) на пуле 500 RPD",
+      "description": "Независимый критик на OpenAI GPT-6.1 Terra Fast (кросс-ревью кода, написанного Sol Fast)",
       "mode": "subagent",
-      "model": "google/gemini-3.1-flash-lite",
-      "system": "Запусти git diff и проверь код строго по 5 пунктам из rules.md (4 пакета, ctx первым аргументом, %w для ошибок, uuidv7/RETURNING в PG18, атомарность файлов). Если все ок — выведи 'VERDICT: PASS'. Иначе до 3 ошибок FILE:LINE.",
+      "model": "openai/gpt-6.1-terra-fast",
+      "system": "Запусти git diff и проверь код строго по 5 пунктам из rules.md (4 пакета, ctx первым аргументом, %w для ошибок, uuidv7/RETURNING в PG18, атомарность файлов и изоляция тестов). Если все ок — выведи 'VERDICT: PASS'. Иначе до 3 ошибок FILE:LINE.",
       "permissions": [
         { "action": "read", "resource": "*", "effect": "allow" },
         { "action": "bash", "resource": "git diff*", "effect": "allow" },
@@ -216,7 +197,20 @@
         { "action": "edit", "resource": "*", "effect": "deny" },
         { "action": "write", "resource": "*", "effect": "deny" }
       ]
-    }
+    },
 
+    "explore": {
+      "description": "Быстрый поиск по кодовой базе за счет бесплатного пула 500 RPD Google",
+      "mode": "subagent",
+      "model": "openai/gpt-6.1-terra-fast",
+      "permissions": [
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "glob", "resource": "*", "effect": "allow" },
+        { "action": "grep", "resource": "*", "effect": "allow" },
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "write", "resource": "*", "effect": "deny" },
+        { "action": "bash", "resource": "*", "effect": "deny" }
+      ]
+    }
   }
 }

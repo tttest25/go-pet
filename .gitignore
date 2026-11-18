@@ -48,6 +48,7 @@ spool/processing/*
 # Служебные файлы выгрузки проекта
 bundle.py
 project_bundle_go_pet.txt
+bundle_go_pet.txt
 .opencode/tasks/
 
 # Резервные копии конфигов OpenCode и локальные скрипты бандлинга
