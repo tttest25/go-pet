@@ -116,6 +116,8 @@
 
 ## Phase 3: Documentation, Operations Runbook & Deployment Guide
 
+- [x] **T19: Ограничить ожидание HTTP и БД.** HTTP header/read/write/idle: 5/15/20/60s; вызов БД из HTTP — до 5s (API 504, readiness 503). Приёмка: медленное тело, дедлайн БД, обычный запрос, shutdown с активным запросом, сборка и race/gate. План: `.opencode/tasks/19_http_db_timeouts.md`.
+
 - [x] **T16: Безопасный тестовый lifecycle и quality gate**
   - Единый `PETAR_TEST_DB_DSN`, изолированная `petar_test`, явные prepare/check/reset.
   - Общий lock lifecycle/gate/прямых тестов; без остановки app на другой БД.

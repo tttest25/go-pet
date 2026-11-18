@@ -130,6 +130,24 @@ func requireJSONContentType(t *testing.T, response *httptest.ResponseRecorder) {
 	}
 }
 
+func TestListJobsHasDatabaseDeadline(t *testing.T) {
+	f := newFakeDatabase()
+	server := newServer(f, apiTestLogger())
+	before := time.Now()
+	response := performRequest(server, http.MethodGet, "/api/v1/jobs", "")
+	after := time.Now()
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", response.Code)
+	}
+	deadline, ok := f.listJobsContext.Deadline()
+	if !ok {
+		t.Fatal("ListJobs context has no database deadline")
+	}
+	if deadline.Before(before.Add(5*time.Second)) || deadline.After(after.Add(5*time.Second)) {
+		t.Fatalf("deadline = %v, want within call interval + 5s", deadline)
+	}
+}
+
 func TestHealthz(t *testing.T) {
 	database := newFakeDatabase()
 	server := newServer(database, apiTestLogger())

@@ -21,6 +21,8 @@ import (
 
 const maxRequestBodyBytes = 1 << 20
 
+var errDatabaseDeadline = errors.New("HTTP database deadline exceeded")
+
 type databaseAPI interface {
 	Ping(ctx context.Context) error
 	GetProcess(ctx context.Context, processID uuid.UUID) (db.ProcessDetails, error)
@@ -42,9 +44,10 @@ type databaseAPI interface {
 }
 
 type Server struct {
-	database databaseAPI
-	handler  http.Handler
-	logger   *slog.Logger
+	databaseTimeout time.Duration
+	database        databaseAPI
+	handler         http.Handler
+	logger          *slog.Logger
 }
 
 type createInputRequest struct {
@@ -129,8 +132,9 @@ func newServer(database databaseAPI, logger *slog.Logger) *Server {
 	}
 
 	server := &Server{
-		database: database,
-		logger:   logger,
+		databaseTimeout: 5 * time.Second,
+		database:        database,
+		logger:          logger,
 	}
 
 	mux := http.NewServeMux()
@@ -162,8 +166,13 @@ func (s *Server) handleGetProcess(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "invalid process ID")
 		return
 	}
-	process, err := s.database.GetProcess(r.Context(), processID)
+	ctx, cancel := context.WithTimeoutCause(r.Context(), s.databaseTimeout, errDatabaseDeadline)
+	defer cancel()
+	process, err := s.database.GetProcess(ctx, processID)
 	if err != nil {
+		if s.writeDatabaseTimeout(ctx, w) {
+			return
+		}
 		if errors.Is(err, pgx.ErrNoRows) {
 			s.writeError(w, http.StatusNotFound, "process not found")
 			return
@@ -234,8 +243,13 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 			filter.Limit = min(limit, 100)
 		}
 	}
-	jobs, err := s.database.ListJobs(r.Context(), filter)
+	ctx, cancel := context.WithTimeoutCause(r.Context(), s.databaseTimeout, errDatabaseDeadline)
+	defer cancel()
+	jobs, err := s.database.ListJobs(ctx, filter)
 	if err != nil {
+		if s.writeDatabaseTimeout(ctx, w) {
+			return
+		}
 		s.logger.Error("list jobs through HTTP API failed",
 			"method", r.Method, "path", r.URL.Path, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "failed to list jobs")
@@ -245,7 +259,9 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
-	if err := s.database.Ping(r.Context()); err != nil {
+	ctx, cancel := context.WithTimeoutCause(r.Context(), s.databaseTimeout, errDatabaseDeadline)
+	defer cancel()
+	if err := s.database.Ping(ctx); err != nil {
 		s.logger.Error(
 			"database readiness probe failed",
 			"method", r.Method,
@@ -276,8 +292,13 @@ func (s *Server) handleCreateInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	created, err := s.database.CreateInput(r.Context(), source, request.Payload)
+	ctx, cancel := context.WithTimeoutCause(r.Context(), s.databaseTimeout, errDatabaseDeadline)
+	defer cancel()
+	created, err := s.database.CreateInput(ctx, source, request.Payload)
 	if err != nil {
+		if s.writeDatabaseTimeout(ctx, w) {
+			return
+		}
 		if errors.Is(err, db.ErrInvalidInput) {
 			s.writeError(w, http.StatusBadRequest, "invalid payload")
 			return
@@ -338,13 +359,18 @@ func (s *Server) handleUpdateJobStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx, cancel := context.WithTimeoutCause(r.Context(), s.databaseTimeout, errDatabaseDeadline)
+	defer cancel()
 	if err := s.database.UpdateJobStatus(
-		r.Context(),
+		ctx,
 		jobID,
 		request.Status,
 		request.ResultPath,
 		request.ErrorMsg,
 	); err != nil {
+		if s.writeDatabaseTimeout(ctx, w) {
+			return
+		}
 		if errors.Is(err, pgx.ErrNoRows) {
 			s.writeError(
 				w,
@@ -366,6 +392,15 @@ func (s *Server) handleUpdateJobStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// Only called on database errors: a successful result wins over a late timer.
+func (s *Server) writeDatabaseTimeout(ctx context.Context, w http.ResponseWriter) bool {
+	if !errors.Is(context.Cause(ctx), errDatabaseDeadline) {
+		return false
+	}
+	s.writeError(w, http.StatusGatewayTimeout, "database request timed out")
+	return true
 }
 
 func decodeJSON(

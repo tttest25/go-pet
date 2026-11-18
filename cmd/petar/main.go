@@ -64,16 +64,7 @@ func run() error {
 		logger,
 	)
 	apiServer := api.NewServer(database, logger)
-	httpServer := &http.Server{
-		Addr:              cfg.HTTPAddr,
-		Handler:           apiServer.Handler(),
-		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		ErrorLog: slog.NewLogLogger(
-			logger.Handler(),
-			slog.LevelError,
-		),
-	}
+	httpServer := newHTTPServer(cfg.HTTPAddr, apiServer.Handler(), logger)
 
 	logger.Info(
 		"petar initialized",
@@ -150,4 +141,16 @@ func run() error {
 
 	logger.Info("shutdown complete")
 	return runErr
+}
+
+func newHTTPServer(addr string, handler http.Handler, logger *slog.Logger) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      20 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
+	}
 }
