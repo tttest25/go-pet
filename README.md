@@ -217,7 +217,8 @@ Unit создаёт **оператор**, не приложение. Приме�
 непривилегированного пользователя, а не вымышленную учётную запись `petar`.
 Сначала настройте права из раздела выше, HOME, CLI и конфигурацию fabric.
 Команды рассчитаны на обычные имена/пути без пробелов и кавычек.
-На хосте runner нужны Bash, `jq`, `curl`, GNU coreutils (включая `timeout`)
+На хосте runner нужны Bash, `jq`, `python3` (только стандартная библиотека),
+`curl`, GNU coreutils (включая `timeout` и `mktemp`)
 и `flock` из util-linux. `yt-dlp` и `fabric` нужны для заданий соответствующих типов.
 
 ```bash
@@ -226,7 +227,7 @@ test "$(id -u)" -eq 1000
 RUNNER_USER="$(id -un)"
 RUNNER_HOME="$(getent passwd "$RUNNER_USER" | cut -d: -f6)"
 RUNNER_PATH="$RUNNER_HOME/.local/bin:$RUNNER_HOME/go/bin:/usr/local/bin:/usr/bin:/bin"
-env HOME="$RUNNER_HOME" PATH="$RUNNER_PATH" bash -c 'command -v jq curl timeout flock yt-dlp fabric'
+env HOME="$RUNNER_HOME" PATH="$RUNNER_PATH" bash -c 'command -v jq python3 curl timeout mktemp flock yt-dlp fabric'
 sudo tee /etc/systemd/system/petar-spool-runner.service >/dev/null <<EOF
 [Unit]
 Description=petar host spool runner
@@ -525,8 +526,9 @@ Content-Type: application/json
 Ошибки правил, включая активную v2 без валидатора, дают JSON 400 без вставок.
 Другие ошибки БД → JSON 500; истечение собственного DB-бюджета при ошибке
 → JSON 504. Ответ 201 имеет те же четыре поля, что и выше; существующие GET
-не меняются. В spool рядом с `tool_name` добавлено число `action_version`;
-текущий runner его не использует.
+не меняются. Runner выбирает обработчик по `tool_name` и корневому
+`action_version`: для `echo-test`, `fabric` и `yt-dlp` поддерживается только
+число 1. Только отсутствие поля означает v1; версия из payload игнорируется.
 
 Callback разрешён только для исходных `dispatched/in_progress`:
 `in_progress`, `completed` с непустым `result_path`, `failed` с непустым `error_msg`.
@@ -725,6 +727,29 @@ Fabric читает `payload.text` через stdin, запускается с `
 сохраняется отдельно в `out/<job_id>/stderr.log`, в том числе при ошибке.
 Частичный stdout при `failed` — диагностика, а не подтверждённый результат.
 Артефакты могут содержать чувствительные данные.
+
+Перед `completed` runner атомарно переименовывает подготовленный файл в
+`out/<job_id>/public.json`. В файле ровно три поля: `type` (имя действия),
+`version` (число `1`, версия формата результата) и `data`:
+
+| `type` | `data` |
+| --- | --- |
+| `echo-test` | `{"echo":"hello"}`; если `message` отсутствует, используется `"default echo"` |
+| `fabric` | `{"text":"…"}`; полный непустой UTF-8 из `output.md`, включая конечные переводы строк |
+| `yt-dlp` | `{"items":[…]}`; один элемент на объект stdout в исходном порядке, только строковые `title` и/или `description` (хотя бы одно из полей в каждом элементе) |
+
+Служебные пути, stderr и остальные метаданные в публичный документ не попадают;
+сам текст не редактируется. Неподдерживаемая версия, недоступный CLI или
+невалидный вывод приводят к `failed` без публикации, но диагностические файлы
+сохраняются. При ручном повторе runner удаляет старый `public.json` только после
+подтверждения нового `in_progress`; если старую публикацию невозможно очистить,
+runner останавливается и сохраняет `processing` для сверки. Если не получено
+подтверждение `completed`, подготовленный публичный файл и `processing`
+сохраняются, а callback не повторяется.
+
+Legacy callback по-прежнему передаёт `/spool/out/<job_id>/result.json`.
+`public.json` — файловый контракт, а не HTTP-ресурс: чтение через API отложено
+до T26. Старые завершённые задания не обрабатываются повторно.
 
 ## 4. Operations: аудит и recovery
 
@@ -935,7 +960,7 @@ fallback hosts и runtime options отклоняются. Ошибки не до
 
 GitHub Actions использует Go из `go.mod`, канонический `/opt/go-pet` и
 доступный пользователю `/tmp/opencode`. Для ручного воспроизведения нужны Docker,
-Go/C toolchain, Bash, jq, curl, `flock`, GNU `timeout` и `psql`. Следующие
+Go/C toolchain, Bash, jq, `python3`, curl, `flock`, GNU coreutils и `psql`. Следующие
 команды — **только для одноразового runner** без существующего `petar_postgres`
 и с незанятым `127.0.0.1:5432`. Не заменяйте рабочий контейнер.
 

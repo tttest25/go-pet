@@ -13,7 +13,7 @@ if [[ ! "$RUNNER_TOOL_TIMEOUT" =~ ^[1-9][0-9]{0,4}$ ]] || (( RUNNER_TOOL_TIMEOUT
     exit 1
 fi
 
-for cmd in jq curl timeout flock mkdir mv rm sleep; do
+for cmd in jq python3 curl timeout flock mkdir mktemp mv rm sleep; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "Error: required tool '$cmd' is not installed." >&2
         exit 1
@@ -62,7 +62,22 @@ run_tool() {
     { timeout --kill-after=1s "${RUNNER_TOOL_TIMEOUT}s" "$@" 2>"$stderr_path" {lock_fd}>&-; } 2>/dev/null
 }
 
+supports_action_version() {
+    # jq 1.6 rounds JSON numbers to binary64; a fraction can compare equal to 1.
+    python3 - "$1" 2>/dev/null <<'PY'
+import json
+import sys
+from decimal import Decimal
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    job = json.load(source, parse_int=Decimal, parse_float=Decimal)
+version = job["action_version"] if "action_version" in job else Decimal(1)
+sys.exit(not (isinstance(version, Decimal) and version == 1))
+PY
+}
+
 validated_tool() {
+    supports_action_version "$1" || return 1
     # The SQL validator remains authoritative; reject malformed spool arguments
     # before Bash converts them to strings or passes them to a CLI.
     jq -er '
@@ -88,6 +103,75 @@ validated_tool() {
     ' "$1" 2>/dev/null
 }
 
+prepare_public() {
+    local tool="$1" job_file="$2" dir="$3"
+    case "$tool" in
+        echo-test)
+            jq '{"type":"echo-test","version":1,"data":{"echo":(.payload.message // "default echo")}}' "$job_file"
+            ;;
+        fabric|yt-dlp)
+            local artifact="$dir/output.md"
+            if [[ "$tool" == yt-dlp ]]; then artifact="$dir/result.json"; fi
+            python3 - "$tool" "$artifact" <<'PY'
+import json
+import re
+import sys
+from decimal import Decimal
+from pathlib import Path
+
+
+def invalid_constant(value):
+    raise ValueError("non-JSON constant: " + value)
+
+
+def project_items(text):
+    decoder = json.JSONDecoder(parse_constant=invalid_constant, parse_int=Decimal)
+    whitespace = re.compile(r"[ \t\r\n]*")
+    items = []
+    offset = whitespace.match(text).end()
+    while offset < len(text):
+        obj, end = decoder.raw_decode(text, offset)
+        if not isinstance(obj, dict):
+            raise ValueError("expected metadata object")
+        item = {key: obj[key] for key in ("title", "description")
+                if isinstance(obj.get(key), str)}
+        if not item:
+            raise ValueError("expected title or description")
+        items.append(item)
+        offset = whitespace.match(text, end).end()
+    if not items:
+        raise ValueError("empty metadata stream")
+    return items
+
+
+# Decode the original bytes strictly and retain all line endings.
+tool, artifact = sys.argv[1:]
+text = Path(artifact).read_bytes().decode("utf-8")
+if tool == "fabric":
+    if not text:
+        sys.exit(1)
+    data = {"text": text}
+else:
+    data = {"items": project_items(text)}
+result = json.dumps({"type": tool, "version": 1, "data": data}, ensure_ascii=False)
+sys.stdout.buffer.write((result + "\n").encode("utf-8"))
+PY
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+publish_public() {
+    local tool="$1" job_file="$2" dir="$3" tmp
+    tmp=$(mktemp -- "$dir/.public.XXXXXX") || return 1
+    if prepare_public "$tool" "$job_file" "$dir" > "$tmp" &&
+        mv -fT -- "$tmp" "$dir/public.json"; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
+}
+
 process_job() {
     local json_file="$1"
     local job_id
@@ -109,18 +193,25 @@ process_job() {
         return 1
     fi
 
+    job_out_dir="$OUT_DIR/$job_id"
+    # Do not reuse the previous attempt's publication or follow an aliased job directory.
+    if [[ -L "$job_out_dir" ]] || ! rm -f -- "$job_out_dir/public.json" 2>/dev/null; then
+        printf 'Error: job %s cannot clear previous public result; check the spool and database before manual recovery.\n' \
+            "$job_id" >&2
+        return 1
+    fi
+
     local exec_status=0
     local error_msg=""
 
     if tool_name=$(validated_tool "$json_file"); then
-        job_out_dir="$OUT_DIR/$job_id"
         mkdir -p "$job_out_dir"
         result_path="$job_out_dir/result.json"
     fi
 
     case "$tool_name" in
         echo-test)
-            jq '{"status":"ok","echo":(.payload.message // "default echo")}' "$json_file" > "$result_path" 2>/dev/null
+            jq '{"status":"ok","echo":(.payload.message // "default echo")}' "$json_file" > "$result_path" 2>/dev/null || exec_status=$?
             ;;
         yt-dlp)
             if command -v yt-dlp &>/dev/null; then
@@ -140,7 +231,7 @@ process_job() {
                 if jq -j '.payload.text' "$json_file" 2>/dev/null |
                     run_tool "$job_out_dir/stderr.log" fabric --pattern "$pattern" > "$job_out_dir/output.md"; then
                     jq -n --arg p "$pattern" --arg path "$job_out_dir/output.md" \
-                        '{"pattern":$p,"output_path":$path}' > "$result_path"
+                        '{"pattern":$p,"output_path":$path}' > "$result_path" || exec_status=$?
                 else
                     pipeline_status=("${PIPESTATUS[@]}")
                     exec_status=${pipeline_status[1]}
@@ -156,9 +247,15 @@ process_job() {
             ;;
         *)
             exec_status=1
-            error_msg="Invalid job tool or payload"
+            error_msg="Invalid job tool, action version or payload"
             ;;
     esac
+
+    if [[ $exec_status -eq 0 ]] &&
+        ! publish_public "$tool_name" "$json_file" "$job_out_dir" 2>/dev/null; then
+        exec_status=1
+        error_msg="Could not prepare or publish public result"
+    fi
 
     if [[ $exec_status -eq 0 ]]; then
         local body

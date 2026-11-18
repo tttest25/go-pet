@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -33,7 +34,7 @@ func newRunnerFixture(t *testing.T) *runnerFixture {
 			t.Fatal(err)
 		}
 	}
-	for _, name := range []string{"bash", "jq", "basename", "tail", "mkdir", "mv", "rm", "flock", "timeout", "sleep", "cat"} {
+	for _, name := range []string{"bash", "jq", "python3", "basename", "tail", "mkdir", "mktemp", "mv", "rm", "flock", "timeout", "sleep", "cat"} {
 		path, err := exec.LookPath(name)
 		if err != nil {
 			t.Fatal(err)
@@ -65,6 +66,9 @@ while (($#)); do
 done
 code=204
 rc=0
+if [[ ${CHECK_PUBLIC:-} && $(jq -r .status "$FIXTURE/post-$n.json") == completed ]]; then
+  jq -es 'length == 1 and (.[0] | type == "object")' "$SPOOL_DIR/out/$CHECK_PUBLIC/public.json" >/dev/null
+fi
 if [[ $n == "${FAULT_POST:-none}" ]]; then
   code=$FAULT_CODE
   rc=$FAULT_EXIT
@@ -136,6 +140,191 @@ func (f *runnerFixture) absent(path string) {
 	}
 }
 
+func TestRunnerUnsupportedActionVersion(t *testing.T) {
+	f := newRunnerFixture(t)
+	f.write(filepath.Join(f.spool, "in", runnerID+".json"),
+		`{"id":"`+runnerID+`","tool_name":"echo-test","action_version":2,"payload":{"tool":"echo-test","message":"hello"}}`, 0600)
+	out, err := f.run()
+	if err != nil {
+		t.Fatalf("confirmed failure should exit normally: %v\n%s", err, out)
+	}
+	posts := f.posts()
+	if len(posts) != 2 || posts[0]["status"] != "in_progress" || posts[1]["status"] != "failed" || posts[1]["error_msg"] == "" {
+		t.Fatalf("want in_progress → failed with an error; got %v", posts)
+	}
+	f.absent("spool/out/" + runnerID + "/public.json")
+}
+
+func TestRunnerActionVersion(t *testing.T) {
+	for _, tc := range []struct {
+		name, version, payloadVersion, status string
+	}{
+		{"null", `,"action_version":null`, "", "failed"},
+		{"string", `,"action_version":"1"`, "", "failed"},
+		{"boolean", `,"action_version":true`, "", "failed"},
+		{"fraction", `,"action_version":1.5`, "", "failed"},
+		{"fraction-near-one", `,"action_version":1.00000000000000001`, "", "failed"},
+		{"zero", `,"action_version":0`, "", "failed"},
+		{"payload-cannot-enable", `,"action_version":2`, `,"action_version":1`, "failed"},
+		{"payload-cannot-disable", `,"action_version":1`, `,"action_version":2`, "completed"},
+		{"legacy-ignores-payload", "", `,"action_version":2`, "completed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRunnerFixture(t)
+			f.write(filepath.Join(f.spool, "in", runnerID+".json"),
+				`{"id":"`+runnerID+`","tool_name":"echo-test"`+tc.version+`,"payload":{"tool":"echo-test"`+tc.payloadVersion+`}}`, 0600)
+			f.checkTerminal(tc.status)
+		})
+	}
+}
+
+func (f *runnerFixture) checkTerminal(status string) {
+	f.t.Helper()
+	out, err := f.run()
+	if err != nil {
+		f.t.Fatalf("confirmed %s should exit normally: %v\n%s", status, err, out)
+	}
+	posts := f.posts()
+	if len(posts) != 2 || posts[0]["status"] != "in_progress" || posts[1]["status"] != status ||
+		(status == "failed" && posts[1]["error_msg"] == "") {
+		f.t.Fatalf("want in_progress → %s; got %v", status, posts)
+	}
+	if status == "failed" {
+		f.absent("spool/out/" + runnerID + "/public.json")
+	} else if posts[1]["result_path"] != "/spool/out/"+runnerID+"/result.json" {
+		f.t.Errorf("legacy callback path: %v", posts[1])
+	}
+}
+
+func checkRunnerJSON(t *testing.T, got, want string) {
+	t.Helper()
+	var gotDoc, wantDoc any
+	if err := json.Unmarshal([]byte(got), &gotDoc); err != nil {
+		t.Fatalf("invalid output JSON: %v (%q)", err, got)
+	}
+	if err := json.Unmarshal([]byte(want), &wantDoc); err != nil {
+		t.Fatalf("invalid expected JSON: %v (%q)", err, want)
+	}
+	if !reflect.DeepEqual(gotDoc, wantDoc) {
+		t.Errorf("JSON = %s, want %s", got, want)
+	}
+}
+
+func TestRunnerPublicEcho(t *testing.T) {
+	for _, tc := range []struct{ name, message, want string }{
+		{"legacy-default", "", `"default echo"`},
+		{"explicit-v1", `,"message":"hello"`, `"hello"`},
+		{"linebreaks", `,"message":"hello\nworld\n\n"`, `"hello\nworld\n\n"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRunnerFixture(t)
+			payload := `{"tool":"echo-test"` + tc.message + `}`
+			if tc.name == "legacy-default" {
+				f.job(runnerID, "echo-test", payload)
+			} else {
+				f.write(filepath.Join(f.spool, "in", runnerID+".json"),
+					`{"id":"`+runnerID+`","tool_name":"echo-test","action_version":1,"payload":`+payload+`}`, 0600)
+			}
+			f.env = append(f.env, "CHECK_PUBLIC="+runnerID)
+			f.checkTerminal("completed")
+			dir := "spool/out/" + runnerID + "/"
+			checkRunnerJSON(t, f.read(dir+"result.json"), `{"status":"ok","echo":`+tc.want+`}`)
+			checkRunnerJSON(t, f.read(dir+"public.json"), `{"type":"echo-test","version":1,"data":{"echo":`+tc.want+`}}`)
+		})
+	}
+	t.Run("rename-failure", func(t *testing.T) {
+		f := newRunnerFixture(t)
+		f.job(runnerID, "echo-test", `{"tool":"echo-test"}`)
+		realMV, err := os.Readlink(filepath.Join(f.bin, "mv"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(filepath.Join(f.bin, "mv")); err != nil {
+			t.Fatal(err)
+		}
+		f.env = append(f.env, "REAL_MV="+realMV)
+		f.program("mv", `
+if [[ ${!#} == */public.json ]]; then exit 42; fi
+exec "$REAL_MV" "$@"
+`)
+		f.checkTerminal("failed")
+		dir := "spool/out/" + runnerID + "/"
+		checkRunnerJSON(t, f.read(dir+"result.json"), `{"status":"ok","echo":"default echo"}`)
+		files, err := os.ReadDir(filepath.Join(f.root, dir))
+		if err != nil || len(files) != 1 {
+			t.Errorf("after failed rename only result.json should remain: %v (%v)", files, err)
+		}
+	})
+}
+
+func TestRunnerPublicFabric(t *testing.T) {
+	for _, tc := range []struct{ name, stdout, want string }{
+		{"utf8", "# Привет\r\n\n", `{"type":"fabric","version":1,"data":{"text":"# Привет\r\n\n"}}`},
+		{"empty", "", ""},
+		{"invalid-utf8", "invalid \xff\n", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRunnerFixture(t)
+			f.job(runnerID, "fabric", `{"tool":"fabric","text":"input"}`)
+			f.env = append(f.env, "FAKE_STDOUT="+tc.stdout)
+			f.program("fabric", `cat >/dev/null; printf '%s' "$FAKE_STDOUT"; printf 'stderr-secret\n' >&2`)
+			dir := "spool/out/" + runnerID + "/"
+			if tc.want == "" {
+				f.checkTerminal("failed")
+			} else {
+				f.env = append(f.env, "CHECK_PUBLIC="+runnerID)
+				f.checkTerminal("completed")
+				checkRunnerJSON(t, f.read(dir+"public.json"), tc.want)
+			}
+			if got := f.read(dir + "output.md"); got != tc.stdout {
+				t.Errorf("output.md = %q, want %q", got, tc.stdout)
+			}
+			if got := f.read(dir + "stderr.log"); got != "stderr-secret\n" {
+				t.Errorf("stderr = %q", got)
+			}
+			checkRunnerJSON(t, f.read(dir+"result.json"), `{"pattern":"summarize","output_path":`+
+				strconv.Quote(filepath.Join(f.root, dir, "output.md"))+`}`)
+		})
+	}
+}
+
+func TestRunnerPublicYTDLP(t *testing.T) {
+	for _, tc := range []struct{ name, stdout, items string }{
+		{"single", `{"title":"Title","result_path":"/private","id":"secret"}`, `[{"title":"Title"}]`},
+		{"stream", "{\"description\":\"текст\\n\",\"output_path\":\"/private\",\"title\":7}\n" +
+			"{\"title\":\"Second\",\"description\":\"Both\",\"stderr\":\"secret\"}\n",
+			`[{"description":"текст\n"},{"title":"Second","description":"Both"}]`},
+		{"empty", " \n\t", ""},
+		{"array", `[{"title":"wrong"}]`, ""},
+		{"nonstring-fields", `{"title":7,"description":null}`, ""},
+		{"invalid-second-object", "{\"title\":\"First\"}\n{\"id\":\"second\"}", ""},
+		{"malformed-tail", "{\"title\":\"First\"}\n{\"title\":", ""},
+		{"invalid-json-constant", `{"title":"First","extra":NaN}`, ""},
+		{"invalid-utf8", "{\"title\":\"\xff\"}", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRunnerFixture(t)
+			f.job(runnerID, "yt-dlp", `{"tool":"yt-dlp","url":"https://example.org/v"}`)
+			f.program("yt-dlp", `printf '%s' "$FAKE_STDOUT"; printf 'stderr-secret\n' >&2`)
+			f.env = append(f.env, "FAKE_STDOUT="+tc.stdout)
+			dir := "spool/out/" + runnerID + "/"
+			if tc.items == "" {
+				f.checkTerminal("failed")
+			} else {
+				f.env = append(f.env, "CHECK_PUBLIC="+runnerID)
+				f.checkTerminal("completed")
+				checkRunnerJSON(t, f.read(dir+"public.json"), `{"type":"yt-dlp","version":1,"data":{"items":`+tc.items+`}}`)
+			}
+			if got := f.read(dir + "result.json"); got != tc.stdout {
+				t.Errorf("raw result = %q, want %q", got, tc.stdout)
+			}
+			if got := f.read(dir + "stderr.log"); got != "stderr-secret\n" {
+				t.Errorf("stderr = %q", got)
+			}
+		})
+	}
+}
+
 func TestRunnerMissingCLI(t *testing.T) {
 	t.Run("yt-dlp", func(t *testing.T) {
 		checkRunnerMissingCLI(t, "yt-dlp", `{"tool":"yt-dlp","url":"https://example.org/v"}`)
@@ -160,7 +349,46 @@ func checkRunnerMissingCLI(t *testing.T, tool, payload string) {
 		t.Errorf("missing CLI not diagnosed: %v", posts[1])
 	}
 	f.absent("spool/out/" + runnerID + "/result.json")
+	f.absent("spool/out/" + runnerID + "/public.json")
 	f.absent("spool/processing/" + runnerID + ".json")
+}
+
+func TestRunnerStalePublicResult(t *testing.T) {
+	for _, confirmed := range []bool{false, true} {
+		t.Run("confirmed-"+strconv.FormatBool(confirmed), func(t *testing.T) {
+			f := newRunnerFixture(t)
+			f.job(runnerID, "fabric", `{"tool":"fabric","text":"input"}`)
+			f.program("fabric", `cat >/dev/null; printf 'run' > "$FIXTURE/runs"; exit 7`)
+			const otherID = "019a0000-0000-7000-8000-000000000002"
+			const stale = `{"type":"echo-test","version":1,"data":{"echo":"old"}}`
+			for _, id := range []string{runnerID, otherID} {
+				dir := filepath.Join(f.spool, "out", id)
+				if err := os.MkdirAll(dir, 0700); err != nil {
+					t.Fatal(err)
+				}
+				f.write(filepath.Join(dir, "public.json"), stale, 0600)
+			}
+			if confirmed {
+				f.checkTerminal("failed")
+				f.read("runs")
+				f.absent("spool/processing/" + runnerID + ".json")
+			} else {
+				f.env = append(f.env, "FAULT_POST=0", "FAULT_CODE=500", "FAULT_EXIT=0")
+				out, err := f.run()
+				if posts := f.posts(); err == nil || len(posts) != 1 || posts[0]["status"] != "in_progress" {
+					t.Fatalf("unconfirmed in_progress: exit = %v, posts = %v\n%s", err, posts, out)
+				}
+				f.absent("runs")
+				f.read("spool/processing/" + runnerID + ".json")
+				if got := f.read("spool/out/" + runnerID + "/public.json"); got != stale {
+					t.Errorf("unconfirmed attempt changed previous public result: %q", got)
+				}
+			}
+			if got := f.read("spool/out/" + otherID + "/public.json"); got != stale {
+				t.Errorf("another job's public result changed: %q", got)
+			}
+		})
+	}
 }
 
 func TestRunnerCallback(t *testing.T) {
@@ -183,7 +411,7 @@ func TestRunnerCallback(t *testing.T) {
 				if stage == "in_progress" {
 					index = "0"
 				}
-				f.program("yt-dlp", `printf 'run\n' >> "$FIXTURE/runs"; printf '{"ok":true}'; exit `+toolExit)
+				f.program("yt-dlp", `printf 'run\n' >> "$FIXTURE/runs"; printf '{"title":"Callback fixture","id":"fixture-id"}'; exit `+toolExit)
 				f.env = append(f.env, "FAULT_POST="+index, "FAULT_CODE="+fault.code, "FAULT_EXIT="+fault.exit)
 
 				out, err := f.run()
@@ -228,8 +456,14 @@ func TestRunnerCallback(t *testing.T) {
 					if runs := f.read("runs"); runs != "run\n" {
 						t.Errorf("CLI runs = %q", runs)
 					}
-					if result := f.read("spool/out/" + runnerID + "/result.json"); result != `{"ok":true}` {
+					if result := f.read("spool/out/" + runnerID + "/result.json"); result != `{"title":"Callback fixture","id":"fixture-id"}` {
 						t.Errorf("result not preserved: %q", result)
+					}
+					if stage == "failed" {
+						f.absent("spool/out/" + runnerID + "/public.json")
+					} else {
+						checkRunnerJSON(t, f.read("spool/out/"+runnerID+"/public.json"),
+							`{"type":"yt-dlp","version":1,"data":{"items":[{"title":"Callback fixture"}]}}`)
 					}
 				} else {
 					f.absent("runs")
@@ -276,7 +510,7 @@ func TestRunnerToolExecution(t *testing.T) {
 	}{
 		{"echo-default", "echo-test", `{"tool":"echo-test"}`, "", "result.json", "default echo", nil, false},
 		{"echo-message", "echo-test", `{"tool":"echo-test","message":"hello\n\n"}`, "", "result.json", "hello\n\n", nil, false},
-		{"yt-dlp", "yt-dlp", `{"tool":"yt-dlp","url":"` + url + `"}`, "", "result.json", `{"captured":true}`, []string{"--dump-json", "--", url}, false},
+		{"yt-dlp", "yt-dlp", `{"tool":"yt-dlp","url":"` + url + `"}`, "", "result.json", `{"title":"Captured","id":"fixture-id"}`, []string{"--dump-json", "--", url}, false},
 		{"fabric", "fabric", `{"tool":"fabric","text":` + strconv.Quote(text) + `,"pattern":"custom-1"}`, text, "output.md", "# stdout\n", []string{"--pattern", "custom-1"}, false},
 		{"fabric-default", "fabric", `{"tool":"fabric","text":` + strconv.Quote(text) + `}`, text, "output.md", "# stdout\n", []string{"--pattern", "summarize"}, false},
 		{"fabric-nonzero", "fabric", `{"tool":"fabric","text":` + strconv.Quote(text) + `}`, text, "output.md", "# partial\n", []string{"--pattern", "summarize"}, true},
@@ -311,6 +545,7 @@ func TestRunnerToolExecution(t *testing.T) {
 					t.Errorf("expected brief CLI failure, got %v", posts[1])
 				}
 				f.absent(resultDir + "result.json")
+				f.absent(resultDir + "public.json")
 			} else if posts[1]["status"] != "completed" || posts[1]["result_path"] != "/spool/out/"+runnerID+"/result.json" {
 				t.Errorf("expected completed with legacy result path, got %v", posts[1])
 			}
@@ -388,6 +623,7 @@ exec sleep 60
 			if f.read(dir+"result.json") != "partial stdout\n" || f.read(dir+"stderr.log") != "partial stderr\n" {
 				t.Error("partial output was not preserved")
 			}
+			f.absent(dir + "public.json")
 			f.absent("spool/processing/" + runnerID + ".json")
 		})
 	}
@@ -481,7 +717,7 @@ func TestRunnerInvalidJob(t *testing.T) {
 			f := newRunnerFixture(t)
 			const v4 = "557f79b1-1594-4399-9d6d-bdf9fbbc14dd"
 			f.job(v4, tc.tool, tc.payload)
-			for _, tool := range []string{"yt-dlp", "fabric"} {
+			for _, tool := range []string{"yt-dlp", "fabric", "other-secret"} {
 				f.program(tool, `printf 'run' > "$FIXTURE/runs"`)
 			}
 			out, err := f.run()

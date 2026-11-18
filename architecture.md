@@ -4,7 +4,7 @@
 
 petar — лёгкий оркестратор фоновых задач и обработки знаний с целевым бюджетом
 1 vCPU / 1 GB RAM. Это ориентир развёртывания, не гарантия потребления внешними CLI.
-Документ описывает реализованные Phase 1–2 и API действий до T24.
+Документ описывает реализованные Phase 1–2 и контракт действий до T25.
 Команды развёртывания, эксплуатации, восстановления и проверок — в [README](README.md).
 
 - **DB-centric state machine:** PostgreSQL 18 хранит очередь, состояния, аудит и
@@ -100,7 +100,7 @@ PostgreSQL ограничен `mem_limit: 450m`, `max_connections=20`, `io_metho
 ├── spool/
 │   ├── in/                      # Публикуемые Go JSON-задания
 │   ├── processing/              # Задания, перемещённые runner
-│   └── out/                     # result.json и, для fabric, output.md
+│   └── out/                     # public.json и внутренние артефакты
 ├── Dockerfile                   # Go builder, Alpine runtime, UID 1000
 ├── docker-compose.yml           # postgres + app, build.network: host
 ├── go.mod                       # module petar
@@ -218,7 +218,7 @@ failed                    --> failed
   08   Go writer    -->  Rename: spool/in/<id>.json
   09   Runner       -->  mv: in/<id>.json -> processing/<id>.json
   10   Runner       -->  API: callback in_progress -> sm_update_job_status -> 204
-  11   Runner       -->  CLI: выполнение -> spool/out/<id>/result.json
+  11   Runner       -->  выполнение -> внутренние файлы; при успехе -> public.json
   12   Runner       -->  API: callback completed / failed
   13   API          -->  PostgreSQL: sm_update_job_status
   14   PostgreSQL   -->  при completed: INSERT sm_outputs; COMMIT
@@ -242,7 +242,9 @@ Worker выгружает все pending на старте, затем проб�
 
 Файл `in/<job_id>.json` содержит `id,process_id,tool_name,action_version,payload,old_status,status`
 (обычно `pending/dispatched`). `action_version` — число из строки задания, а не
-из payload или актуального каталога. Текущий runner не использует это поле.
+из payload или актуального каталога. Runner допускает только пары
+`(echo-test,1)`, `(fabric,1)`, `(yt-dlp,1)`. Только отсутствие корневого
+`action_version` означает v1; неверный тип или неизвестная версия отклоняются.
 Writer выполняет `.tmp -> file.Sync() -> file.Close()
 -> os.Rename(.json)`, поэтому runner не читает частично записанный JSON.
 **Захват в БД и публикация файла не образуют общую транзакцию.**
@@ -269,6 +271,24 @@ HTTP 204 job/process и один output сохранились вместе с `
 | `echo-test` | `payload.message` (default `default echo`) → `result.json` с `status:"ok",echo` |
 | `yt-dlp` | `yt-dlp --dump-json -- "$url"` → метаданные в `result.json`; не скачивает аудио и не делает транскрипцию |
 | `fabric` | `payload.text` через stdin, `fabric --pattern "$pattern"` (default `summarize`) → `output.md`, при успехе также `result.json` с `pattern,output_path` |
+
+До `completed` runner публикует `out/<job_id>/public.json` атомарным
+переименованием из того же каталога. Документ содержит ровно `type` (имя
+действия), `version` (число `1`, версия формата) и `data`:
+`echo-test` — `{"echo":"…"}` без потери переводов строк, `fabric` —
+`{"text":"…"}` с полным непустым UTF-8 содержимым stdout, `yt-dlp` —
+`{"items":[…]}` с одним элементом на объект stdout в том же порядке, только
+со строковыми `title` и/или `description` (хотя бы одно в каждом элементе).
+Невалидный вывод отклоняется целиком. В публичный файл не входят служебные пути,
+stderr и остальные метаданные. Внутренние файлы и путь callback
+`/spool/out/<job_id>/result.json` сохраняют прежний контракт; API не читает
+публичный файл (T26), старые завершённые задания не пересчитываются.
+
+Ручной повтор того же ID очищает старую публикацию после подтверждённого
+`in_progress` и до запуска обработчика. Если очистка невозможна, runner
+останавливается с сохранением `processing` для сверки. Потеря подтверждения
+терминального callback сохраняет `processing` и доступные артефакты, включая
+новый `public.json`, если он уже опубликован.
 
 Отсутствие CLI, ошибка или таймаут → `failed`. Внешний CLI ограничен GNU `timeout`:
 по умолчанию 300 с, затем 1 с grace до KILL. Stderr записывается отдельно в
