@@ -27,6 +27,7 @@ type databaseAPI interface {
 	Ping(ctx context.Context) error
 	GetProcess(ctx context.Context, processID uuid.UUID) (db.ProcessDetails, error)
 	ListJobs(ctx context.Context, filter db.JobFilter) ([]db.JobDetails, error)
+	GetJobStatus(ctx context.Context, jobID uuid.UUID) (db.Status, error)
 	ListActions(ctx context.Context) ([]db.ActionVersion, error)
 	CreateAction(ctx context.Context, action string, version int32, data json.RawMessage) (db.CreatedInput, error)
 
@@ -50,6 +51,7 @@ type Server struct {
 	database        databaseAPI
 	handler         http.Handler
 	logger          *slog.Logger
+	spoolDir        string
 }
 
 type createInputRequest struct {
@@ -136,8 +138,10 @@ func jobsResponse(jobs []db.JobDetails) []jobDetailsResponse {
 	return result
 }
 
-func NewServer(database *db.DB, logger *slog.Logger) *Server {
-	return newServer(database, logger)
+func NewServer(database *db.DB, spoolDir string, logger *slog.Logger) *Server {
+	server := newServer(database, logger)
+	server.spoolDir = spoolDir
+	return server
 }
 
 func newServer(database databaseAPI, logger *slog.Logger) *Server {
@@ -156,6 +160,7 @@ func newServer(database databaseAPI, logger *slog.Logger) *Server {
 	mux.HandleFunc("GET /readyz", server.handleReadyz)
 	mux.HandleFunc("GET /api/v1/processes/{id}", server.handleGetProcess)
 	mux.HandleFunc("GET /api/v1/jobs", server.handleListJobs)
+	mux.HandleFunc("GET /api/v1/jobs/{id}/result", server.handleGetJobResult)
 	mux.HandleFunc("GET /api/v1/actions", server.handleListActions)
 	mux.HandleFunc("POST /api/v1/actions", server.handleCreateAction)
 	mux.HandleFunc("POST /api/v1/inputs", server.handleCreateInput)

@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -27,6 +29,7 @@ type fakeDatabase struct {
 	getProcessErr                      error
 	listJobsResult                     []db.JobDetails
 	listJobsErr                        error
+	getJobStatus                       func(context.Context, uuid.UUID) (db.Status, error)
 	listActionsResult                  []db.ActionVersion
 	listActionsErr                     error
 	listActionsContext                 context.Context
@@ -77,6 +80,10 @@ func (f *fakeDatabase) ListJobs(ctx context.Context, filter db.JobFilter) ([]db.
 	f.listJobsCalls++
 	f.listJobsFilter, f.listJobsContext = filter, ctx
 	return f.listJobsResult, f.listJobsErr
+}
+
+func (f *fakeDatabase) GetJobStatus(ctx context.Context, id uuid.UUID) (db.Status, error) {
+	return f.getJobStatus(ctx, id)
 }
 
 func (f *fakeDatabase) Ping(context.Context) error {
@@ -1292,6 +1299,84 @@ func TestListActionsDisablePreservesJob(t *testing.T) {
 	}
 }
 
+func TestGetJobResultSelectsRequestedJob(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	server, verification := newActionsIntegrationServer(ctx, t)
+	root := server.spoolDir
+	processID, jobA := createJobResultFixture(ctx, t, verification)
+	var jobB uuid.UUID
+	if err := verification.QueryRow(ctx, `INSERT INTO public.sm_jobs (process_id, tool_name)
+		VALUES ($1, 'echo-test') RETURNING id`, processID).Scan(&jobB); err != nil {
+		t.Fatal(err)
+	}
+	jobs := []struct {
+		id       uuid.UUID
+		document string
+	}{
+		{jobA, `{"type":"echo-test","version":1,"data":{"echo":"first"}}`},
+		{jobB, `{"type":"echo-test","version":1,"data":{"echo":"second"}}`},
+	}
+	for _, job := range jobs {
+		dir := writeJobResultFixture(t, root, job.id, job.document)
+		privatePath := filepath.Join(dir, "result.json")
+		if err := os.WriteFile(privatePath, []byte(`{"private":"never return this"}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := verification.Exec(ctx, `UPDATE public.sm_jobs SET status='dispatched' WHERE id=$1`, job.id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := verification.Exec(ctx, `SELECT public.sm_update_job_status($1, 'completed', $2, '')`,
+			job.id, privatePath); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, job := range jobs {
+		t.Run(job.id.String(), func(t *testing.T) {
+			response := performRequest(server, http.MethodGet, "/api/v1/jobs/"+strings.ToUpper(job.id.String())+"/result", "")
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body: %s", response.Code, response.Body)
+			}
+			requireJSONContentType(t, response)
+			if response.Body.String() != job.document {
+				t.Fatalf("body = %q, want %q", response.Body, job.document)
+			}
+		})
+	}
+}
+
+func createJobResultFixture(ctx context.Context, t *testing.T, verification *pgxpool.Pool) (processID, jobID uuid.UUID) {
+	t.Helper()
+	var inputID uuid.UUID
+	if err := verification.QueryRow(ctx, `SELECT input_id, process_id
+		FROM public.sm_create_input('t26-test', '{"tool":"echo-test"}'::jsonb)`).Scan(&inputID, &processID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := verification.Exec(ctx, `DELETE FROM public.sm_inputs WHERE id=$1`, inputID); err != nil {
+			t.Errorf("clean T26 fixture: %v", err)
+		}
+	})
+	if err := verification.QueryRow(ctx, `SELECT id FROM public.sm_jobs WHERE process_id=$1`, processID).Scan(&jobID); err != nil {
+		t.Fatal(err)
+	}
+	return processID, jobID
+}
+
+func writeJobResultFixture(t *testing.T, root string, id uuid.UUID, document string) string {
+	t.Helper()
+	dir := filepath.Join(root, "out", id.String())
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "public.json"), []byte(document), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 func newActionsIntegrationServer(ctx context.Context, t *testing.T) (*Server, *pgxpool.Pool) {
 	t.Helper()
 	dsn := requireTestDSN(ctx, t)
@@ -1305,7 +1390,7 @@ func newActionsIntegrationServer(ctx context.Context, t *testing.T) (*Server, *p
 		t.Fatalf("create verification pool: %v", err)
 	}
 	t.Cleanup(verification.Close)
-	return NewServer(database, apiTestLogger()), verification
+	return NewServer(database, t.TempDir(), apiTestLogger()), verification
 }
 
 type actionContract struct {
@@ -1377,7 +1462,7 @@ func TestServerIntegration(t *testing.T) {
 		verification.Close()
 	})
 
-	httpServer := httptest.NewServer(NewServer(database, apiTestLogger()).Handler())
+	httpServer := httptest.NewServer(NewServer(database, t.TempDir(), apiTestLogger()).Handler())
 	t.Cleanup(httpServer.Close)
 
 	requestBody, err := json.Marshal(createInputRequest{

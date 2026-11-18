@@ -18,6 +18,7 @@ const (
 	pickNextJobQuery  = `SELECT id, process_id, tool_name, payload, old_status, status, action_version
 		FROM public.sm_pick_next_job_with_version()`
 	updateJobStatusQuery = `SELECT sm_update_job_status($1, $2, $3, $4)`
+	getJobStatusQuery    = `SELECT status FROM public.sm_jobs WHERE id = $1`
 	getProcessQuery      = `SELECT id, input_id, state, context, created_at, updated_at
 		FROM sm_processes WHERE id = $1`
 	getProcessJobsQuery = `SELECT id, process_id, tool_name, payload, status, priority,
@@ -35,6 +36,14 @@ const (
 		  ))
 		ORDER BY j.created_at DESC, j.id DESC LIMIT $4`
 )
+
+func (d *DB) GetJobStatus(ctx context.Context, jobID uuid.UUID) (Status, error) {
+	var status Status
+	if err := d.pool.QueryRow(ctx, getJobStatusQuery, jobID).Scan(&status); err != nil {
+		return "", fmt.Errorf("get job %s status: %w", jobID, err)
+	}
+	return status, nil
+}
 
 func (d *DB) GetProcess(ctx context.Context, processID uuid.UUID) (ProcessDetails, error) {
 	result := ProcessDetails{Jobs: make([]JobDetails, 0), Outputs: make([]OutputDetails, 0)}

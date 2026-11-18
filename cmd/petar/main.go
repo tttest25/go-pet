@@ -63,7 +63,7 @@ func run() error {
 		cfg.PollInterval,
 		logger,
 	)
-	apiServer := api.NewServer(database, logger)
+	apiServer := api.NewServer(database, cfg.SpoolDir, logger)
 	httpServer := newHTTPServer(cfg.HTTPAddr, apiServer.Handler(), logger)
 
 	logger.Info(
