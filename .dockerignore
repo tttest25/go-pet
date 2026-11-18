@@ -1,2 +1,4 @@
 postgres/data/
 postgres/data
+postgres/.ci-postgres.*
+postgres/.fresh-bootstrap.*

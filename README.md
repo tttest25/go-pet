@@ -96,6 +96,17 @@ Entrypoint выполняет SQL по имени, не понимая up/down: 
 схемы после одного `up`. На существующем data dir initdb повторно не запускается.
 Никогда не удаляйте `postgres/data` ради повторного bootstrap.
 
+**Наблюдение T21:** на PostgreSQL 18.6 текущие восемь файлов (down перед up
+для каждой пары) успешно отработали в пустом PGDATA. Финальный TCP-сервер
+поднялся; найдены три расширения, `dokuwiki_files`, пять таблиц, четыре SQL-функции
+и три включённых триггера. Пробный `sm_create_input` создал одну pending-задачу
+и был откатан. Это результат для текущих файлов и образа, не гарантия обновлений.
+Воспроизведение: `./scripts/check-fresh-bootstrap.sh`. Скрипт использует
+тот же образ, конфиг, команду и read-only mount миграций, но собственный каталог
+под `postgres/`, без опубликованных портов и без restart loop. Он выводит состояние
+контейнера и логи initdb; `FRESH BOOTSTRAP PASSED` означает, что прошли проверки
+схемы и пробной вставки, не только проверка доступности сервера.
+
 ```bash
 cd /opt/go-pet
 docker compose up -d postgres
@@ -700,8 +711,10 @@ SQL
    прекращена. Сохраните исходные записи/артефакты.
 2. Архивируйте только файлы выбранного ID, уберите их из активных in/processing.
    **Не** переносите processing обратно в in одновременно с DB requeue.
-3. Выберите ровно один SQL-вариант: requeue либо failed. Просмотрите запись
-   непосредственно перед операцией.
+3. Просмотрите запись непосредственно перед операцией. Requeue либо failed —
+   варианты только для `dispatched/in_progress`. Если `completed` уже записан
+   и output указывает на сохранённый результат, оставьте результат по исходному
+   пути и ограничьтесь архивированием `processing`: без SQL-мутации и без повторного POST.
 4. Проверьте audit/process, запустите app, дождитесь readyz, затем runner.
 
 ```bash
@@ -854,6 +867,29 @@ tar -C /opt/go-pet -xzf "${BACKUP%.dump}-spool.tar.gz"
 URL и keyword/value DSN разбираются драйвером; неоднозначные маршруты, service,
 fallback hosts и runtime options отклоняются. Ошибки не должны содержать пароль.
 
+### Воспроизводимый CI на чистом Linux runner
+
+GitHub Actions использует Go из `go.mod`, канонический `/opt/go-pet` и
+доступный пользователю `/tmp/opencode`. Для ручного воспроизведения нужны Docker,
+Go/C toolchain, Bash, jq, curl, `flock`, GNU `timeout` и `psql`. Следующие
+команды — **только для одноразового runner** без существующего `petar_postgres`
+и с незанятым `127.0.0.1:5432`. Не заменяйте рабочий контейнер.
+
+```bash
+cd /opt/go-pet
+./scripts/provision-ci-postgres.sh
+export PETAR_TEST_DB_DSN='postgres://petar_user:petar_password@127.0.0.1:5432/petar_test?sslmode=disable'
+./scripts/ci-checks.sh
+docker build --network host .
+```
+
+Provisioning проверяет SQL по опубликованному TCP: PG18 готов, `petar_test`
+ещё отсутствует. Используются новый bind-каталог под `postgres/` и начальная
+БД `postgres`, без initdb mount и без app. `ci-checks.sh` последовательно
+выполняет `prepare`, `check`, настоящий gate с `GOFLAGS=-count=1` и
+`go build ./...`; первый сбой прекращает цепочку. Сборка образа в Actions
+зависит от этого job. Проверка fresh Compose bootstrap — отдельный job.
+
 ### Подготовка отдельной тестовой БД
 
 Подготовка отдельная и явная. Gate и прямые тесты не создают/не ремонтируют БД.
@@ -911,6 +947,29 @@ lifecycle/gate или интеграционный test binary, включая c
 Reset допустим только при исключённом внешнем администрировании `petar_test`;
 flock сериализует участников протокола, но не суперпользователя PostgreSQL.
 Интеграционный spool остаётся в `t.TempDir()`, общий spool не очищается.
+
+### Recovery drills
+
+После `prepare`/`check` с тем же тестовым DSN, без app/runner на `petar_test`:
+
+```bash
+go test -p=1 -count=1 -v -race ./internal/spool \
+  -run '^TestRecovery(DispatchWithoutFile|CommittedCallbackResponseLost)$'
+```
+
+- **Dispatch без файла:** тест делает pick без записи в spool; job/process —
+  `dispatched/running`, активных файлов нет, повторный pick пуст. Адресный
+  guarded UPDATE из варианта A возвращает тот же UUID в `pending`; штатные
+  pick/write и один проход runner дают `completed`, правильный echo, один
+  output и аудит двух dispatch и возврата.
+- **Потеря ответа после commit:** loopback handler сначала фиксирует `completed`
+  через штатную функцию БД, затем закрывает HTTP/1.1 соединение без 204.
+  Runner завершается ошибкой, сохраняя `processing` и результат; SELECT уже
+  показывает `completed` и один output. После архивирования только `processing`
+  второй проход не отправляет callbacks и не меняет аудит, output или результат.
+
+Оба drill выводят job UUID до и после восстановления, используют временный
+spool и не затрагивают рабочие файлы. Они проверяют ручную сверку, а не exactly-once.
 
 ### Прямые race-тесты и SKIP LOCKED
 

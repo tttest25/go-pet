@@ -140,3 +140,5 @@
 - [x] **T18: Сохранить опрос очереди при потере LISTEN.** Worker журналирует потерю подписки и продолжает публиковать pending-задания по `POLL_INTERVAL`. Попытки reconnect идут по одной, с паузой 1 с после ошибки. Приёмка: один ERROR на эпизод потери, файл опубликован до восстановления, после него работают уведомления; штатная отмена без ложной тревоги; race-тесты и quality gate.
 
 - [x] **T20: Исключить ложный успех хостового runner.** Нет CLI, nonzero или timeout → `failed`; только HTTP 204 подтверждает callback, иначе `processing` сохраняется для сверки БД. Приёмка: Go harness проверяет argv/stdin, артефакты, ошибки callback, UUID и flock; race и quality gate. План: `.opencode/tasks/20_spool_runner_hardening.md`.
+
+- [x] **T21: Воспроизводимый CI и ручное восстановление MVP.** Чистый PG18 проходит prepare/check, vet, сериализованный race без cache и сборку; отдельно проверены fresh bootstrap, dispatch без файла и потеря ответа после commit callback. План: `.opencode/tasks/21_reproducible_ci.md`.
