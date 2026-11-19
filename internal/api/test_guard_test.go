@@ -389,6 +389,10 @@ func checkTestSchema(ctx context.Context, conn *pgx.Conn) error {
 	err := conn.QueryRow(ctx, `SELECT
 	(SELECT count(*)=6 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind='r' AND c.relname IN ('sm_inputs','sm_processes','sm_jobs','sm_job_logs','sm_outputs','sm_actions'))
 	AND (SELECT count(*)=3 FROM pg_extension WHERE extname IN ('vector','file_fdw','pg_trgm'))
+	AND EXISTS (SELECT FROM public.sm_actions WHERE action='word-count' AND version=1)
+	AND EXISTS (SELECT FROM pg_constraint WHERE conrelid=to_regclass('public.sm_jobs')
+	  AND conname='sm_jobs_tool_name_check' AND contype='c' AND convalidated
+	  AND strpos(pg_get_constraintdef(oid), $$'word-count'$$)>0)
 	AND to_regprocedure('public.sm_create_input(text,jsonb)') IS NOT NULL
 	AND to_regprocedure('public.sm_create_action(text,integer,jsonb)') IS NOT NULL
 	AND EXISTS (SELECT FROM information_schema.columns
@@ -406,7 +410,7 @@ func checkTestSchema(ctx context.Context, conn *pgx.Conn) error {
 		return testDatabaseError("query required schema objects", err)
 	}
 	if !valid {
-		return errors.New("test database: required public tables, columns, functions, extensions or enabled triggers missing")
+		return errors.New("test database: required tables, columns, functions, extensions, triggers or 000007 word-count baseline missing")
 	}
 	return nil
 }

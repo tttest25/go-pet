@@ -161,4 +161,4 @@
 
 - [x] **T26: Чтение публичного результата по job_id.** GET возвращает только `public.json` запрошенного completed job (до 1 МиБ); неготовый → 202, failed → 409, неизвестный → 404, утраченный файл → 410, превышение → 500 без частичной выдачи. Приёмка: два job одного процесса, граничный размер, без внутренних путей и логов. Зависит от T25. План: [.opencode/tasks/26_job_public_result.md](.opencode/tasks/26_job_public_result.md).
 
-- [ ] **T27: Доказательство расширяемости на word-count.** Зарегистрировать действие, валидатор и обработчик. Приёмка: `{"text":"один два три"}` → `{"words":3}` без изменения HTTP-обработчиков и кода wiki под это действие. Backend-проверка после T22–T26; сквозная wiki-проверка после PHP-06/07. План: [.opencode/tasks/go_pet_actions_roadmap.md](.opencode/tasks/go_pet_actions_roadmap.md).
+- [ ] **T27: Доказательство расширяемости на word-count.** Backend: каталог → POST → runner → GET по job ID, `{"text":"один два три"}` → `data:{"words":3}` без правок HTTP-обработчиков и wiki. Статус: backend принят; ожидается wiki E2E после PHP-06/07. План: [.opencode/tasks/27_word_count.md](.opencode/tasks/27_word_count.md).

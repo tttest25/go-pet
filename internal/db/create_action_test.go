@@ -37,12 +37,15 @@ func testActionEnqueue(t *testing.T, env *queueTestEnv) {
 		return result
 	}
 	const create = `SELECT input_id, process_id, status FROM public.sm_create_action($1,$2,$3)`
-	for _, tc := range []struct{ action, data, payload string }{
-		{"echo-test", `{}`, `{"tool":"echo-test"}`},
-		{"yt-dlp", `{"url":"https://example.org/video"}`, `{"tool":"yt-dlp","url":"https://example.org/video"}`},
-		{"fabric", `{"text":" body ","extra":{"n":9007199254740993}}`, `{"tool":"fabric","text":" body ","extra":{"n":9007199254740993}}`},
+	for _, tc := range []struct{ name, action, data, payload string }{
+		{"echo-test", "echo-test", `{}`, `{"tool":"echo-test"}`},
+		{"yt-dlp", "yt-dlp", `{"url":"https://example.org/video"}`, `{"tool":"yt-dlp","url":"https://example.org/video"}`},
+		{"fabric", "fabric", `{"text":" body ","extra":{"n":9007199254740993}}`, `{"tool":"fabric","text":" body ","extra":{"n":9007199254740993}}`},
+		{"word-count", "word-count", `{"text":"один два три"}`, `{"tool":"word-count","text":"один два три"}`},
+		{"word-count empty", "word-count", `{"text":""}`, `{"tool":"word-count","text":""}`},
+		{"word-count separators", "word-count", `{"text":" \n\t\u00a0\u2003","extra":{"n":9007199254740993}}`, `{"tool":"word-count","text":" \n\t\u00a0\u2003","extra":{"n":9007199254740993}}`},
 	} {
-		if !t.Run(tc.action, func(t *testing.T) {
+		if !t.Run(tc.name, func(t *testing.T) {
 			before := counts(t)
 			var inputID, processID uuid.UUID
 			var status string
@@ -53,7 +56,7 @@ func testActionEnqueue(t *testing.T, env *queueTestEnv) {
 			var matches int
 			if err := tx.QueryRow(ctx, `SELECT count(*) FROM sm_inputs i JOIN sm_processes p ON p.input_id=i.id
 				JOIN sm_jobs j ON j.process_id=p.id WHERE i.id=$1 AND p.id=$2 AND i.source='api'
-				AND i.payload=$3::jsonb AND j.payload=i.payload AND j.tool_name=$4 AND j.status='pending'`,
+				AND i.payload=$3::jsonb AND j.payload=i.payload AND j.tool_name=$4 AND j.status='pending' AND j.action_version=1`,
 				inputID, processID, tc.payload, tc.action).Scan(&matches); err != nil || matches != 1 {
 				t.Fatalf("matching input/process/job chains=%d error=%v", matches, err)
 			}
@@ -86,6 +89,15 @@ func testActionEnqueue(t *testing.T, env *queueTestEnv) {
 		{"bad echo", "echo-test", 1, `{"message":null}`, ""},
 		{"bad fabric", "fabric", 1, `{}`, ""},
 		{"bad URL", "yt-dlp", 1, `{"url":"/relative"}`, ""},
+		{"word-count missing text", "word-count", 1, `{}`, ""},
+		{"word-count null text", "word-count", 1, `{"text":null}`, ""},
+		{"word-count numeric text", "word-count", 1, `{"text":42}`, ""},
+		{"word-count array text", "word-count", 1, `{"text":[]}`, ""},
+		{"word-count object text", "word-count", 1, `{"text":{}}`, ""},
+		{"word-count boolean text", "word-count", 1, `{"text":true}`, ""},
+		{"word-count disabled v1", "word-count", 1, `{"text":"hello"}`, `UPDATE sm_actions SET enabled=false WHERE action='word-count' AND version=1`},
+		{"word-count enabled v2", "word-count", 2, `{"text":"hello"}`, `INSERT INTO sm_actions VALUES ('word-count',2,'Word count v2',true)`},
+		{"word-count tool collision", "word-count", 1, `{"text":"hello","tool":"echo-test"}`, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fixture, err := tx.Begin(ctx)
@@ -94,8 +106,8 @@ func testActionEnqueue(t *testing.T, env *queueTestEnv) {
 			}
 			defer fixture.Rollback(ctx)
 			if tc.setup != "" {
-				if _, err := fixture.Exec(ctx, tc.setup); err != nil {
-					t.Fatal(err)
+				if tag, err := fixture.Exec(ctx, tc.setup); err != nil || tag.RowsAffected() != 1 {
+					t.Fatalf("set up action fixture: %v, error=%v", tag, err)
 				}
 			}
 			before := counts(t)
@@ -108,6 +120,12 @@ func testActionEnqueue(t *testing.T, env *queueTestEnv) {
 			if !errors.As(err, &pgErr) || pgErr.Code != "22023" {
 				t.Errorf("error=%v, want SQLSTATE 22023", err)
 			}
+			if err == nil {
+				// Check before rolling back so rollback cannot hide a write.
+				if got := counts(t); got != before {
+					t.Errorf("accepted invalid action changed counts: %v → %v", before, got)
+				}
+			}
 			if err := attempt.Rollback(ctx); err != nil {
 				t.Fatal(err)
 			}
@@ -116,6 +134,30 @@ func testActionEnqueue(t *testing.T, env *queueTestEnv) {
 			}
 		})
 	}
+	t.Run("word-count legacy", func(t *testing.T) {
+		const payload = `{"tool":"word-count","text":"  legacy text  ","extra":true}`
+		before := counts(t)
+		var inputID, processID uuid.UUID
+		var status string
+		err := tx.QueryRow(ctx, `SELECT * FROM public.sm_create_input($1,$2)`, env.source, payload).
+			Scan(&inputID, &processID, &status)
+		if err != nil || status != "new" {
+			t.Fatalf("legacy create: status=%q error=%v", status, err)
+		}
+		var match bool
+		err = tx.QueryRow(ctx, `SELECT EXISTS (
+			SELECT FROM sm_inputs i JOIN sm_processes p ON p.input_id=i.id
+			JOIN sm_jobs j ON j.process_id=p.id
+			WHERE i.id=$1 AND p.id=$2 AND i.source=$3 AND i.payload=$4::jsonb
+			  AND j.payload=i.payload AND j.tool_name='word-count' AND j.action_version=1 AND j.status='pending')`,
+			inputID, processID, env.source, payload).Scan(&match)
+		if err != nil || !match {
+			t.Fatalf("legacy chain matches=%t error=%v", match, err)
+		}
+		if got := counts(t); got != [3]int{before[0] + 1, before[1] + 1, before[2] + 1} {
+			t.Fatalf("expected exactly one new legacy chain: %v → %v", before, got)
+		}
+	})
 }
 
 func testActionVersionColumn(t *testing.T, env *queueTestEnv) {

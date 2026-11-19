@@ -1226,7 +1226,7 @@ func TestListActionsDisablePreservesJob(t *testing.T) {
 			t.Errorf("deleted %d inputs, want 1", tag.RowsAffected())
 		}
 	})
-	body := fmt.Sprintf(`{"source":%q,"payload":{"tool":"echo-test"}}`, source)
+	body := fmt.Sprintf(`{"source":%q,"payload":{"tool":"word-count","text":"keep history"}}`, source)
 	response := performRequest(server, http.MethodPost, "/api/v1/inputs", body)
 	if response.Code != http.StatusCreated {
 		t.Fatalf("POST input status = %d, want 201; body: %s", response.Code, response.Body)
@@ -1257,26 +1257,26 @@ func TestListActionsDisablePreservesJob(t *testing.T) {
 		return jobs[0]
 	}
 	before := readJob()
-	hasEchoV1 := func() bool {
+	hasWordCountV1 := func() bool {
 		for _, row := range readActions(t, server) {
-			if row.Action == "echo-test" && row.Version == 1 {
+			if row.Action == "word-count" && row.Version == 1 {
 				return true
 			}
 		}
 		return false
 	}
-	if !hasEchoV1() {
-		t.Fatal("echo-test v1 missing before disabling")
+	if !hasWordCountV1() {
+		t.Fatal("word-count v1 missing before disabling")
 	}
 
 	var originalEnabled bool
 	err := verification.QueryRow(ctx, `SELECT enabled FROM public.sm_actions
-		WHERE action = 'echo-test' AND version = 1`).Scan(&originalEnabled)
+		WHERE action = 'word-count' AND version = 1`).Scan(&originalEnabled)
 	if err != nil {
 		t.Fatalf("read original seed availability: %v", err)
 	}
 	const setEnabled = `UPDATE public.sm_actions SET enabled = $1
-		WHERE action = 'echo-test' AND version = 1`
+		WHERE action = 'word-count' AND version = 1`
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -1289,10 +1289,18 @@ func TestListActionsDisablePreservesJob(t *testing.T) {
 	})
 	tag, err := verification.Exec(ctx, setEnabled, false)
 	if err != nil || tag.RowsAffected() != 1 {
-		t.Fatalf("disable echo-test v1: updated %d rows (error: %v)", tag.RowsAffected(), err)
+		t.Fatalf("disable word-count v1: updated %d rows (error: %v)", tag.RowsAffected(), err)
 	}
-	if hasEchoV1() {
-		t.Fatal("disabled echo-test v1 still in catalog")
+	if hasWordCountV1() {
+		t.Fatal("disabled word-count v1 still in catalog")
+	}
+	conn, err := verification.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	if err := checkTestSchema(ctx, conn.Conn()); err != nil {
+		t.Fatalf("disabled action must not invalidate the migration baseline: %v", err)
 	}
 	if after := readJob(); !reflect.DeepEqual(after, before) {
 		t.Fatalf("job changed after disabling action: before %v, after %v", before, after)

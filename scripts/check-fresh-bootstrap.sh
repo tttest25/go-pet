@@ -75,9 +75,10 @@ SELECT current_setting('server_version_num')::int BETWEEN 180000 AND 189999
    AND to_regclass('public.sm_job_logs') IS NOT NULL
    AND to_regclass('public.sm_outputs') IS NOT NULL
    AND to_regclass('public.sm_actions') IS NOT NULL
-   AND (SELECT count(*) = 3
+   AND (SELECT count(*) = 4
           AND bool_or((action, version) = ('echo-test', 1))
           AND bool_or((action, version) = ('fabric', 1))
+          AND bool_or((action, version) = ('word-count', 1))
           AND bool_or((action, version) = ('yt-dlp', 1))
         FROM public.sm_actions WHERE enabled)
    AND to_regprocedure('public.sm_create_input(text,jsonb)') IS NOT NULL
@@ -100,16 +101,16 @@ SELECT current_setting('server_version_num')::int BETWEEN 180000 AND 189999
 \endif
 BEGIN;
 SELECT * FROM sm_create_input('fresh-bootstrap-probe','{"tool":"echo-test"}') \gset
-SELECT * FROM public.sm_create_action('echo-test',1,'{"message":"bootstrap"}') \gset action_
+SELECT * FROM public.sm_create_action('word-count',1,'{"text":"один два три"}') \gset action_
 SELECT :'input_id' AS input_id, :'process_id' AS process_id, :'status' AS status;
 WITH expected(input_id, process_id, status, source, payload) AS (
     VALUES (:'input_id'::uuid, :'process_id'::uuid, :'status', 'fresh-bootstrap-probe', '{"tool":"echo-test"}'::jsonb),
            (:'action_input_id'::uuid, :'action_process_id'::uuid, :'action_status', 'api',
-            '{"tool":"echo-test","message":"bootstrap"}'::jsonb)
+            '{"tool":"word-count","text":"один два три"}'::jsonb)
 )
 SELECT count(*) = 2 AND count(DISTINCT e.input_id) = 2
     AND bool_and(e.status='new' AND i.status='new' AND i.source=e.source AND i.payload=e.payload
-                 AND p.state='init' AND j.status='pending' AND j.tool_name='echo-test'
+                 AND p.state='init' AND j.status='pending' AND j.tool_name=e.payload->>'tool'
                  AND j.action_version=1 AND j.payload=e.payload) AS probe_ok
 FROM expected e JOIN sm_inputs i ON i.id=e.input_id
 JOIN sm_processes p ON p.id=e.process_id AND p.input_id=i.id

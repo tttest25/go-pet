@@ -98,9 +98,31 @@ validated_tool() {
             elif $tool == "fabric" then
                 (.text | nonblank) and
                 ((has("pattern") | not) or (.pattern | matches("\\A[A-Za-z0-9_-]{1,128}\\z")))
+            elif $tool == "word-count" then
+                .text | type == "string"
             else false end
         ) | $tool
     ' "$1" 2>/dev/null
+}
+
+count_words() {
+    run_tool "$2" python3 - "$1" <<'PY'
+import json
+import sys
+from decimal import Decimal
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    text = json.load(source, parse_int=Decimal)["payload"]["text"]
+words = 0
+previous_space = True
+for char in text:
+    # Python also treats U+001C..U+001F as spaces; Unicode White_Space does not.
+    space = char.isspace() and not "\x1c" <= char <= "\x1f"
+    if previous_space and not space:
+        words += 1
+    previous_space = space
+print(json.dumps({"words": words}))
+PY
 }
 
 prepare_public() {
@@ -108,6 +130,9 @@ prepare_public() {
     case "$tool" in
         echo-test)
             jq '{"type":"echo-test","version":1,"data":{"echo":(.payload.message // "default echo")}}' "$job_file"
+            ;;
+        word-count)
+            jq '{"type":"word-count","version":1,"data":{"words":.words}}' "$dir/result.json"
             ;;
         fabric|yt-dlp)
             local artifact="$dir/output.md"
@@ -212,6 +237,9 @@ process_job() {
     case "$tool_name" in
         echo-test)
             jq '{"status":"ok","echo":(.payload.message // "default echo")}' "$json_file" > "$result_path" 2>/dev/null || exec_status=$?
+            ;;
+        word-count)
+            count_words "$json_file" "$job_out_dir/stderr.log" > "$result_path" || exec_status=$?
             ;;
         yt-dlp)
             if command -v yt-dlp &>/dev/null; then

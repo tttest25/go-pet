@@ -310,6 +310,7 @@ var testMigrationNames = []string{
 	"000004_validate_tool_payload.up.sql",
 	"000005_action_catalog.up.sql",
 	"000006_universal_json_input.up.sql",
+	"000007_word_count.up.sql",
 }
 
 func TestLifecycleMigrationOrder(t *testing.T) {
@@ -320,6 +321,7 @@ func TestLifecycleMigrationOrder(t *testing.T) {
 		"000004_validate_tool_payload.up.sql",
 		"000005_action_catalog.up.sql",
 		"000006_universal_json_input.up.sql",
+		"000007_word_count.up.sql",
 	}
 	if !slices.Equal(testMigrationNames, want) {
 		t.Fatalf("migration order = %v, want %v", testMigrationNames, want)

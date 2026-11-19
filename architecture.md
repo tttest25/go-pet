@@ -4,14 +4,14 @@
 
 petar — лёгкий оркестратор фоновых задач и обработки знаний с целевым бюджетом
 1 vCPU / 1 GB RAM. Это ориентир развёртывания, не гарантия потребления внешними CLI.
-Документ описывает реализованные Phase 1–2 и контракт действий до T26.
+Документ описывает реализованные Phase 1–2 и backend-контракт действий до T27.
 Команды развёртывания, эксплуатации, восстановления и проверок — в [README](README.md).
 
 - **DB-centric state machine:** PostgreSQL 18 хранит очередь, состояния, аудит и
   метаданные результатов; Go делегирует мутации хранимым функциям.
 - **Dumb Executor:** Go 1.23+ обслуживает HTTP, слушает уведомления и публикует задания
   в файловом мосте. Он не строит DAG и не принимает решений о следующем инструменте.
-- **Без Docker-in-Docker:** хостовый Bash runner запускает `echo-test`, `yt-dlp`, `fabric`.
+- **Без Docker-in-Docker:** хостовый Bash runner выполняет `echo-test`, `yt-dlp`, `fabric`, `word-count`.
   Установку и конфигурацию внешних CLI обеспечивает оператор.
 
 ## 2. Компоненты и границы
@@ -93,7 +93,7 @@ PostgreSQL ограничен `mem_limit: 450m`, `max_connections=20`, `io_metho
 │   └── api/                     # net/http ServeMux, публичный результат, logging middleware
 ├── postgres/                    # Вся инфраструктура и SQL БД
 │   ├── data/                    # Bind mount данных, исключён из Git
-│   ├── migrations/              # Пары up/down: 000001–000006
+│   ├── migrations/              # Пары up/down: 000001–000007
 │   └── postgresql.conf          # PostgreSQL 18, лимиты, io_method
 ├── scripts/
 │   ├── spool-runner.sh          # Хостовый исполнитель
@@ -135,9 +135,9 @@ UUID PK таблиц используют нативную `uuidv7()` PostgreSQL
 | `sm_jobs` | `id,process_id,tool_name,action_version,payload,status,priority,result_path,error_msg,created_at,updated_at`; `action_version` — положительный `integer NOT NULL DEFAULT 1`, payload default `{}`, priority default 0 |
 | `sm_job_logs` | `id,job_id,old_status,new_status,message,created_at`; message берётся из `NEW.error_msg` |
 | `sm_outputs` | `id,process_id,artifact_type,content,metadata,created_at`; metadata JSONB default `{}`, content nullable |
-| `sm_actions` | Каталог без FK к истории: PK `(action,version)`, `action` с `COLLATE "C"`, версия > 0, непустой `title`, флаг `enabled`. Начальные активные пары: `echo-test`, `fabric`, `yt-dlp`, все v1 |
+| `sm_actions` | Каталог без FK к истории: PK `(action,version)`, `action` с `COLLATE "C"`, версия > 0, непустой `title`, флаг `enabled`. Начальные активные пары: `echo-test`, `fabric`, `word-count`, `yt-dlp`, все v1 |
 
-`tool_name` ограничен `echo-test/yt-dlp/fabric`; статусы задач и процессов показаны ниже.
+`tool_name` ограничен `echo-test/yt-dlp/fabric/word-count`; статусы задач и процессов показаны ниже.
 `result_path` и `error_msg` nullable. Время хранится как `TIMESTAMPTZ`, по умолчанию `NOW()`.
 Текущий workflow **не переводит input из `new` автоматически**.
 
@@ -162,6 +162,10 @@ UUID PK таблиц используют нативную `uuidv7()` PostgreSQL
 `000006` добавляет обе функции T24 и `action_version`, выставляя v1 у ранее
 созданных и новых legacy-заданий. Её down сохраняет цепочки и каталог, удаляя
 только две новые функции и колонку версии.
+`000007` добавляет `word-count` v1 в каталог, валидатор и CHECK `sm_jobs_tool_name_check`.
+Её down блокирует `sm_jobs` перед проверкой истории; при наличии любого `word-count`
+отказывается без изменений. Иначе восстанавливает старый CHECK и валидатор
+и удаляет только собственную пару v1. Порядок обновления описан в README.
 `trg_sm_jobs_notify` вызывает `pg_notify('sm_jobs_channel', NEW.id::text)` при INSERT pending
 или изменении статуса на pending. Уведомление доставляется после COMMIT.
 `trg_sm_jobs_status_audit` срабатывает только при фактическом изменении статуса,
@@ -244,7 +248,7 @@ Worker выгружает все pending на старте, затем проб�
 Файл `in/<job_id>.json` содержит `id,process_id,tool_name,action_version,payload,old_status,status`
 (обычно `pending/dispatched`). `action_version` — число из строки задания, а не
 из payload или актуального каталога. Runner допускает только пары
-`(echo-test,1)`, `(fabric,1)`, `(yt-dlp,1)`. Только отсутствие корневого
+`(echo-test,1)`, `(fabric,1)`, `(word-count,1)`, `(yt-dlp,1)`. Только отсутствие корневого
 `action_version` означает v1; неверный тип или неизвестная версия отклоняются.
 Writer выполняет `.tmp -> file.Sync() -> file.Close()
 -> os.Rename(.json)`, поэтому runner не читает частично записанный JSON.
@@ -272,12 +276,14 @@ HTTP 204 job/process и один output сохранились вместе с `
 | `echo-test` | `payload.message` (default `default echo`) → `result.json` с `status:"ok",echo` |
 | `yt-dlp` | `yt-dlp --dump-json -- "$url"` → метаданные в `result.json`; не скачивает аудио и не делает транскрипцию |
 | `fabric` | `payload.text` через stdin, `fabric --pattern "$pattern"` (default `summarize`) → `output.md`, при успехе также `result.json` с `pattern,output_path` |
+| `word-count` | Декодирует `payload.text` и считает максимальные последовательности символов вне Unicode White_Space, не разделяя по дефисам или пунктуации; `result.json` содержит `{"words":3}` для «один два три» |
 
 До `completed` runner публикует `out/<job_id>/public.json` атомарным
 переименованием из того же каталога. Документ содержит ровно `type` (имя
 действия), `version` (число `1`, версия формата) и `data`:
 `echo-test` — `{"echo":"…"}` без потери переводов строк, `fabric` —
-`{"text":"…"}` с полным непустым UTF-8 содержимым stdout, `yt-dlp` —
+`{"text":"…"}` с полным непустым UTF-8 содержимым stdout, `word-count` —
+`{"words":3}` (число слов; пустая строка или только разделители дают `0`), `yt-dlp` —
 `{"items":[…]}` с одним элементом на объект stdout в том же порядке, только
 со строковыми `title` и/или `description` (хотя бы одно в каждом элементе).
 Невалидный вывод отклоняется целиком. В публичный файл не входят служебные пути,
@@ -335,7 +341,8 @@ Legacy-вход: `{"source":"manual","payload":{"tool":"echo-test","message":"he
 имя `tool` и поля инструмента: `echo-test.message` необязателен (по умолчанию
 `default echo`); `yt-dlp.url` — абсолютный HTTP(S) URL с host; `fabric.text` —
 непустая строка, необязательный `pattern` — `[A-Za-z0-9_-]{1,128}` (по умолчанию
-`summarize`). Явный `null` не заменяет отсутствующее поле. Строки и дополнительные
+`summarize`); `word-count.text` — обязательная JSON-строка, в том числе пустая.
+Явный `null` не заменяет отсутствующее поле. Строки и дополнительные
 поля не переписываются. Неверный payload или отсутствие активной версии 1
 в каталоге даёт SQLSTATE `22023` → HTTP 400
 без вставок; остальные ошибки создания в БД дают HTTP 500.
@@ -348,7 +355,7 @@ Go проверяет непустое имя без нормализации, J
 1…2147483647 и наличие `data`. Отсутствующий `data` даёт 400 до БД; любое
 присутствующее значение, включая `null`, передаётся PostgreSQL без повторного
 кодирования. `source` не входит в оболочку; PostgreSQL использует `api`.
-Три активные пары v1 проверяются прежним валидатором; `data` должен быть
+Четыре поддерживаемые пары v1 используют общий валидатор; `data` должен быть
 объектом без верхнеуровневого `tool`, который добавляет БД. Отключённая
 или неподдерживаемая пара (включая активную v2 без правил) либо неверные
 данные дают `22023` → JSON 400 без input/process/job. Формат 201 общий с
@@ -455,8 +462,9 @@ Liveness не проверяет БД; readiness проверяет её дос�
   требуют отдельного сохранения файлов и остановки исполнителей.
 - Compose монтирует одновременно `.up.sql` и `.down.sql` в initdb: entrypoint
   обрабатывает SQL по имени, а не по смыслу миграции. Проверка свежего bootstrap
-  на чистом PGDATA требует готовую схему, три активные пары каталога v1 и
-  успешные откатываемые пробы `sm_create_input` и `sm_create_action` с заданиями v1.
+  на чистом PGDATA требует готовую схему, четыре активные пары каталога v1 и
+  успешные откатываемые пробы `sm_create_input` и `sm_create_action('word-count',1,…)`
+  с заданиями v1.
   Initdb не повторяется при рестарте.
   Bootstrap с проверкой объектов и явным порядком up описан в README;
   `000002` не идемпотентна.
@@ -475,5 +483,6 @@ Liveness не проверяет БД; readiness проверяет её дос�
 [payload validation](postgres/migrations/000004_validate_tool_payload.up.sql),
 [action catalog](postgres/migrations/000005_action_catalog.up.sql),
 [universal input](postgres/migrations/000006_universal_json_input.up.sql),
+[word-count](postgres/migrations/000007_word_count.up.sql),
 [writer](internal/spool/writer.go), [worker](internal/spool/worker.go),
 [runner](scripts/spool-runner.sh), [Compose](docker-compose.yml).

@@ -68,6 +68,10 @@ code=204
 rc=0
 if [[ ${CHECK_PUBLIC:-} && $(jq -r .status "$FIXTURE/post-$n.json") == completed ]]; then
   jq -es 'length == 1 and (.[0] | type == "object")' "$SPOOL_DIR/out/$CHECK_PUBLIC/public.json" >/dev/null
+  if [[ ${CHECK_PUBLIC_JSON:-} ]]; then
+    jq -es --argjson expected "$CHECK_PUBLIC_JSON" '. == [$expected]' \
+      "$SPOOL_DIR/out/$CHECK_PUBLIC/public.json" >/dev/null
+  fi
 fi
 if [[ $n == "${FAULT_POST:-none}" ]]; then
   code=$FAULT_CODE
@@ -254,6 +258,65 @@ exec "$REAL_MV" "$@"
 		if err != nil || len(files) != 1 {
 			t.Errorf("after failed rename only result.json should remain: %v (%v)", files, err)
 		}
+	})
+}
+
+func TestRunnerWordCount(t *testing.T) {
+	for _, tc := range []struct {
+		name, version, tool, fields, words string
+	}{
+		{"example", "1", "word-count", `,"text":"один два три"`, "3"},
+		{"empty", "1", "word-count", `,"text":""`, "0"},
+		{"only separators", "1", "word-count", `,"text":" \n\t\u00a0\u2003 "`, "0"},
+		{"mixed separators", "1", "word-count", `,"text":"\u2003один  два\nтри\tчетыре\u00a0пять\u2003шесть\t"`, "6"},
+		{"punctuation", "1", "word-count", `,"text":"раз-два,"`, "1"},
+		{"large ignored integer", "1", "word-count", `,"text":"one two","extra":` + strings.Repeat("9", 5000), "2"},
+		{"not Unicode whitespace", "1", "word-count", `,"text":"a\u001c\u001d\u001e\u001fb\u200bc"`, "1"},
+		{"legacy v1", "", "word-count", `,"text":"one"`, "1"},
+		{"missing text", "1", "word-count", ``, ""},
+		{"nonstring text", "1", "word-count", `,"text":42`, ""},
+		{"tool mismatch", "1", "echo-test", `,"text":"one"`, ""},
+		{"unsupported v2", "2", "word-count", `,"text":"one"`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRunnerFixture(t)
+			f.env = append(f.env, "LC_ALL=C")
+			version := ""
+			if tc.version != "" {
+				version = `,"action_version":` + tc.version
+			}
+			f.write(filepath.Join(f.spool, "in", runnerID+".json"),
+				`{"id":"`+runnerID+`","tool_name":"word-count"`+version+`,"payload":{"tool":"`+tc.tool+`"`+tc.fields+`}}`, 0600)
+			dir := "spool/out/" + runnerID + "/"
+			if tc.words == "" {
+				// Reprocessing an invalid job must not keep a previous publication.
+				if err := os.MkdirAll(filepath.Join(f.root, dir), 0700); err != nil {
+					t.Fatal(err)
+				}
+				f.write(filepath.Join(f.root, dir, "public.json"), `{"type":"word-count","version":1,"data":{"words":99}}`, 0600)
+				f.checkTerminal("failed")
+			} else {
+				want := `{"type":"word-count","version":1,"data":{"words":` + tc.words + `}}`
+				f.env = append(f.env, "CHECK_PUBLIC="+runnerID, "CHECK_PUBLIC_JSON="+want)
+				f.checkTerminal("completed")
+				checkRunnerJSON(t, f.read(dir+"result.json"), `{"words":`+tc.words+`}`)
+				checkRunnerJSON(t, f.read(dir+"public.json"), want)
+			}
+			f.absent("spool/processing/" + runnerID + ".json")
+		})
+	}
+	t.Run("unconfirmed completed", func(t *testing.T) {
+		f := newRunnerFixture(t)
+		f.job(runnerID, "word-count", `{"tool":"word-count","text":"one two"}`)
+		want := `{"type":"word-count","version":1,"data":{"words":2}}`
+		f.env = append(f.env, "CHECK_PUBLIC="+runnerID, "CHECK_PUBLIC_JSON="+want,
+			"FAULT_POST=1", "FAULT_CODE=503", "FAULT_EXIT=0")
+		out, err := f.run()
+		if err == nil || !strings.Contains(out, "callback completed unconfirmed") {
+			t.Fatalf("want unconfirmed completed callback; error=%v output=%s", err, out)
+		}
+		f.read("spool/processing/" + runnerID + ".json")
+		checkRunnerJSON(t, f.read("spool/out/"+runnerID+"/public.json"), want)
 	})
 }
 

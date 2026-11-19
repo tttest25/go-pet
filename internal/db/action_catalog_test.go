@@ -23,7 +23,7 @@ func TestActionCatalogInitialEntries(t *testing.T) {
 		action  string
 		version int
 	}
-	want := []entry{{"echo-test", 1}, {"fabric", 1}, {"yt-dlp", 1}}
+	want := []entry{{"echo-test", 1}, {"fabric", 1}, {"word-count", 1}, {"yt-dlp", 1}}
 	rows, err := conn.Query(ctx, `
 		SELECT action, version FROM public.sm_actions
 		WHERE enabled ORDER BY action COLLATE "C", version`)
