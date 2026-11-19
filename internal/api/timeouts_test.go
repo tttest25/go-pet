@@ -30,11 +30,8 @@ func (f *waitingDatabase) ListActions(ctx context.Context) ([]db.ActionVersion, 
 func (f *waitingDatabase) GetProcess(ctx context.Context, _ uuid.UUID) (db.ProcessDetails, error) {
 	return db.ProcessDetails{}, f.wait(ctx, "GetProcess")
 }
-func (f *waitingDatabase) CreateInput(ctx context.Context, _ string, _ json.RawMessage) (db.CreatedInput, error) {
-	return db.CreatedInput{}, f.wait(ctx, "CreateInput")
-}
 func (f *waitingDatabase) CreateAction(ctx context.Context, _ string, _ int32, _ json.RawMessage) (db.CreatedInput, error) {
-	return db.CreatedInput{}, f.wait(ctx, "CreateAction")
+	return f.createdInput, f.wait(ctx, "CreateAction")
 }
 func (f *waitingDatabase) UpdateJobStatus(ctx context.Context, _ uuid.UUID, _ db.Status, _, _ string) error {
 	return f.wait(ctx, "UpdateJobStatus")
@@ -49,7 +46,6 @@ func TestHTTPDatabaseTimeout(t *testing.T) {
 	}{
 		{"GET", "/api/v1/jobs", "", "ListJobs", 504},
 		{"GET", "/api/v1/processes/" + id, "", "GetProcess", 504},
-		{"POST", "/api/v1/inputs", `{"source":"manual","payload":{"tool":"echo-test"}}`, "CreateInput", 504},
 		{"POST", "/api/v1/actions", `{"action":"echo-test","version":1,"data":{}}`, "CreateAction", 504},
 		{"POST", "/api/v1/jobs/" + id + "/status", `{"status":"in_progress"}`, "UpdateJobStatus", 504},
 		{"GET", "/readyz", "", "Ping", 503},
@@ -133,6 +129,27 @@ func TestHTTPDatabaseTimeout(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCreateActionLateSuccess(t *testing.T) {
+	f := &waitingDatabase{fakeDatabase: newFakeDatabase(), wait: func(ctx context.Context, call string) error {
+		if call != "CreateAction" {
+			t.Fatalf("database call = %s, want CreateAction", call)
+		}
+		<-ctx.Done()
+		if !errors.Is(context.Cause(ctx), errDatabaseDeadline) {
+			t.Fatalf("timeout cause = %v, want database deadline", context.Cause(ctx))
+		}
+		return nil
+	}}
+	server := newServer(f, apiTestLogger())
+	server.databaseTimeout = 10 * time.Millisecond
+	response := performRequest(server, http.MethodPost, "/api/v1/actions",
+		`{"action":"echo-test","version":1,"data":{}}`)
+	requireReadJSON(t, response, http.StatusCreated, map[string]string{
+		"input_id": f.createdInput.InputID.String(), "process_id": f.createdInput.ProcessID.String(),
+		"status": "new", "id": f.createdInput.InputID.String(),
+	})
 }
 
 func TestHTTPShutdownWithActiveRequest(t *testing.T) {

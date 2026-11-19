@@ -92,25 +92,17 @@ Compose services: `postgres`, `app`; контейнеры: `petar_postgres`, `pe
 Сеть: `petar_shared_net` (ключ Compose `petar_net`).
 Пароль примера не подходит для публичного production; API не имеет встроенной авторизации.
 
-**Сначала проверьте схему.** Mount `postgres/migrations` в
-`/docker-entrypoint-initdb.d` содержит и `.up.sql`, и `.down.sql`.
-Entrypoint выполняет SQL по имени, не понимая up/down: на пустом data dir down
-предшествует соответствующему up. Это не migration manager и не гарантия готовой
-схемы после одного `up`. На существующем data dir initdb повторно не запускается.
-Никогда не удаляйте `postgres/data` ради повторного bootstrap.
+**Сначала проверьте схему.** На пустом PGDATA Compose запускает
+`postgres/bootstrap.sh`: только `*.up.sql` по порядку имён, отдельная транзакция
+на файл, остановка при первой ошибке. Down-файлы не выполняются. На существующем
+PGDATA initdb повторно не запускается; никогда не удаляйте `postgres/data` ради
+bootstrap. Для обновления с `000007` следуйте [runbook T28](#переход-с-000007-на-000008-t28).
 
-**Наблюдение T21:** на PostgreSQL 18.6 восемь файлов `000001`–`000004` (down перед up
-для каждой пары) успешно отработали в пустом PGDATA. Финальный TCP-сервер
-поднялся; найдены три расширения, `dokuwiki_files`, пять таблиц, четыре SQL-функции
-и три включённых триггера. Пробный `sm_create_input` создал одну pending-задачу
-и был откатан. Это результат для текущих файлов и образа, не гарантия обновлений.
-Воспроизведение: `./scripts/check-fresh-bootstrap.sh`. Скрипт использует
-тот же образ, конфиг, команду и read-only mount миграций, но собственный каталог
-под `postgres/`, без опубликованных портов и без restart loop. Он выводит состояние
-контейнера и логи initdb; `FRESH BOOTSTRAP PASSED` означает, что прошли проверки
-схемы и пробной вставки, не только проверка доступности сервера. Проверка
-требует четыре точные активные пары v1, функции T24 и `sm_jobs.action_version`,
-с откатываемыми пробами legacy-входа и enqueue `word-count` через `sm_create_action`.
+Проверка: `./scripts/check-fresh-bootstrap.sh` запускает тот же образ и bootstrap
+на одноразовом PGDATA под `postgres/`, без опубликованных портов. `FRESH BOOTSTRAP
+PASSED` означает, что проверены схема, четыре точные активные пары v1,
+`action_version`, отсутствие старой функции и откатываемые пробы `echo-test`
+и `word-count` через `sm_create_action`.
 
 ```bash
 cd /opt/go-pet
@@ -122,7 +114,7 @@ SELECT extname FROM pg_extension ORDER BY extname;
 SELECT srvname FROM pg_foreign_server;
 SELECT to_regclass('sm_inputs'), to_regclass('sm_processes'), to_regclass('sm_jobs'),
        to_regclass('sm_job_logs'), to_regclass('sm_outputs'), to_regclass('public.sm_actions');
-SELECT to_regprocedure('sm_create_input(text,jsonb)'),
+SELECT to_regprocedure('public.sm_create_input(text,jsonb)') IS NULL AS legacy_retired,
        to_regprocedure('public.sm_create_action(text,integer,jsonb)'),
        to_regprocedure('sm_validate_tool_payload(jsonb)'),
        to_regprocedure('sm_pick_next_job()'),
@@ -133,7 +125,7 @@ WHERE table_schema='public' AND table_name='sm_jobs' AND column_name='action_ver
 SQL
 ```
 
-На свежей схеме после `000007` запрос `SELECT action, version FROM
+На свежей схеме после `000008` запрос `SELECT action, version FROM
 public.sm_actions WHERE enabled ORDER BY action, version;` должен вернуть
 `echo-test`, `fabric`, `word-count`, `yt-dlp` (все версии 1). В уже используемом каталоге
 отключённые записи допустимы.
@@ -141,7 +133,7 @@ public.sm_actions WHERE enabled ORDER BY action, version;` должен верн
 Существующая БД: при наличии объектов не повторять `000002` — она не идемпотентна.
 Пустое окружение: после завершения initdb проверьте результаты выше и логи.
 Следующая функция позволяет **явно** применить только недостающие up-файлы
-в порядке 000001 → 000002 → 000003 → 000004 → 000005 → 000006 → 000007; выполняйте соответствующие вызовы лишь
+в порядке `000001` → … → `000008`; выполняйте соответствующие вызовы лишь
 после проверки, не все автоматически:
 
 ```bash
@@ -164,6 +156,7 @@ apply_up() {
 # apply_up 000006_universal_json_input.up.sql
 # Если база уже на 000006, а правила и пара word-count v1 отсутствуют:
 # apply_up 000007_word_count.up.sql
+# 000008 на существующей БД — только через runbook T28 ниже.
 ```
 
 `000001` использует IF NOT EXISTS, `000003` — CREATE OR REPLACE.
@@ -203,6 +196,77 @@ Down удаляет функции T24 и колонку версии, но ос
 наличии истории откат отказывается без изменений. Не удаляйте историю ради отката:
 при необходимости прекратить новый приём отключите пару, оставив совместимый runner
 для ранее принятых заданий.
+
+### Переход с 000007 на 000008 (T28)
+
+Обновление рабочей БД требует отдельного согласования окна и проверенной
+резервной копии. До окна перечислите HTTP-клиентов (BFF, proxy, scripts, cron) и
+SQL-клиентов (включая процедуры/обёртки); подтвердите переход каждого на
+`POST /api/v1/actions` или `public.sm_create_action(text,integer,jsonb)`.
+Проверьте зависимости старой функции в `pg_depend` и отдельно код потребителей:
+не все вызовы отслеживаются каталогом. Сохраните определения, владельцев и
+`proacl` обеих функций (включая исходный `PUBLIC`, роли и grant options), например:
+
+```sql
+SELECT oid::regprocedure, pg_get_userbyid(proowner), proacl, pg_get_functiondef(oid)
+FROM pg_proc
+WHERE oid IN ('public.sm_create_input(text,jsonb)'::regprocedure,
+              'public.sm_create_action(text,integer,jsonb)'::regprocedure);
+```
+
+1. Закройте новый приём на границе HTTP и у SQL-клиентов, включая прямых writers;
+   **оставьте `POST /api/v1/jobs/{id}/status` доступным runner**. Не допускайте
+   запуска дополнительных исполнителей или рестарта runner во время ограждения.
+   Остановите новые захваты. Если диспетчер Go работает вместе с API, в отдельной открытой
+   операторской транзакции захватите `SELECT id FROM public.sm_jobs WHERE
+   status='pending' FOR UPDATE` (установите `SET LOCAL lock_timeout='5s'`).
+   После получения блокировок `SKIP LOCKED` пропускает эти строки; не закрывайте
+   сеанс до остановки старого app. Дождитесь публикации уже захваченных Go заданий.
+   Запретите новые захваты runner на границе подачи работы, не посылая SIGTERM
+   активному CLI. Если у локального loop runner нет такого переключателя, после
+   блокировки pending и подтверждения, что writer больше не публикует файлы,
+   атомарно переименуйте только `spool/in` в свободный соседний каталог на той
+   же ФС: путь `in/*.json` перестанет давать новые задания. Не переносите
+   `processing`; учтите захват, успевший выиграть гонку с ограждением.
+2. Дождитесь подтверждённых терминальных callbacks для уже исполняемых задач.
+   Сверьте БД и spool по UUID: pending без входного файла, dispatched с
+   единственным файлом в `in` (или временно отведённом каталоге) и без файла
+   в `processing`. При оставшемся неоднозначном `processing`, потерянном
+   подтверждении, незавершённой публикации или дубликате остановите переключение;
+   не возвращайте задание в очередь вслепую. Остановите runner и app, закройте
+   транзакцию блокировки, верните отведённый `in` под исходное имя, не смешивая
+   каталоги. Подтвердите отсутствие других writers и автоматических запусков.
+3. Снимите согласованную копию: `pg_dump -Fc` **с владельцами и ACL**,
+   отдельно необходимые роли и членства (например, защищённый
+   `pg_dumpall --globals-only`), `spool/{in,processing,out}` и фактическое
+   хранилище результатов, если оно вне spool. Сохраните манифест ID, связей,
+   статусов, версий, аудита и контрольных сумм файлов. Восстановите комплект в
+   отдельной PG18 с нужными ролями и правами (`pg_restore --exit-on-error` без
+   `--no-owner`/`--no-acl`), в отдельном spool и хранилище; сравните снимок и
+   подтвердите старую работоспособность откатываемой пробой. Не загружайте
+   globals поверх работающего кластера. См. также [backup / restore](#5-operations-backup--restore).
+4. На изолированном стенде отрепетируйте apply–сверку–смену app–возобновление
+   `bash scripts/check-retire-legacy-input.sh`. В согласованном окне применяйте
+   только `apply_up 000008_retire_legacy_input.up.sql` (с `-1`,
+   `ON_ERROR_STOP=1`); отказ `DROP FUNCTION` не обходите через `CASCADE`.
+   До возобновления захвата сравните снимки, убедитесь, что `to_regprocedure`
+   не находит старую сигнатуру и что под ролью приложения новый SQL-вход
+   проходит в откатываемой пробе. Запустите новую версию app с ограждёнными
+   submit и захватами (при необходимости снова держите pending row locks),
+   проверьте готовность, 404 на старом POST и чтение старых результатов.
+   Освободите блокировки, запустите один runner, проверьте старые ID и только
+   после сверки возобновите внешний submit. Контрольный новый POST должен создать
+   ровно одну цепочку; callback-контракт не меняется.
+5. При сбое до возобновления остановите новые компоненты и примените
+   `000008_retire_legacy_input.down.sql` (`psql -X -1 -v ON_ERROR_STOP=1`),
+   либо восстановите проверенный согласованный комплект; только затем
+   запускайте старый app. Down возвращает старую SQL-функцию и делегирование
+   из универсальной. При нестандартных owner/ACL добавьте проверенные команды
+   восстановления прав из снимка в **ту же транзакцию**, чтобы не открыть
+   доступ по умолчанию между операциями. Проверьте обе прежние точки входа и целостность
+   очереди. После новых записей или выполнений не накатывайте старый снимок
+   поверх них: снова оградите writers, сохраните актуальное состояние и
+   согласуйте восстановление без потери новых эффектов.
 
 ### Старт приложения
 
@@ -455,8 +519,8 @@ BFF на хосте может использовать base `http://petar.examp
 ```bash
 PROXY_URL=http://127.0.0.1:8081/api/v1
 RESPONSE="$(curl -fsS -H 'Host: petar.example.test' -H 'X-Request-ID: proxy-check' \
-  -H 'Content-Type: application/json' -d '{"source":"manual","payload":{"tool":"echo-test","message":"proxy"}}' \
-  "$PROXY_URL/inputs")"
+  -H 'Content-Type: application/json' -d '{"action":"echo-test","version":1,"data":{"message":"proxy"}}' \
+  "$PROXY_URL/actions")"
 PROCESS_ID="$(jq -er .process_id <<<"$RESPONSE")"
 curl -fsS -D - -H 'Host: petar.example.test' "$PROXY_URL/processes/$PROCESS_ID"
 curl -fsS --get -H 'Host: petar.example.test' \
@@ -469,13 +533,12 @@ curl -fsS --get -H 'Host: petar.example.test' \
 | --- | --- | --- |
 | `GET /healthz` | 200 `{"status":"ok"}` | — |
 | `GET /readyz` | 200 `{"status":"ready"}` | 503 |
-| `POST /api/v1/inputs` | 201 | 400, 500 |
 | `POST /api/v1/jobs/{id}/status` | 204 без тела | 400, 404, 500 |
 | `GET /api/v1/processes/{id}` | 200 объект | 400, 404, 500 |
 | `GET /api/v1/jobs` | 200 массив | 400, 500 |
 | `GET /api/v1/jobs/{id}/result` | 200 публичный JSON, 202 статус задания | 400, 404, 409, 410, 500, 504 |
 | `GET /api/v1/actions` | 200 массив активных версий | 500, 504 |
-| `POST /api/v1/actions` | 201 в формате legacy | 400, 500, 504 |
+| `POST /api/v1/actions` | 201, IDs и статус input | 400, 500, 504 |
 
 `GET /api/v1/actions` читает каталог PostgreSQL на каждый запрос и возвращает
 массив без обёртки, например `[{"action":"echo-test","version":1,"title":"Echo test"}]`.
@@ -486,11 +549,10 @@ curl -fsS --get -H 'Host: petar.example.test' \
 чтения даёт JSON 504; прочая ошибка БД — JSON 500 без внутренних деталей.
 
 POST принимает ровно один JSON-документ до 1 MiB, неизвестные поля верхнего
-уровня отклоняются. В legacy `POST /api/v1/inputs` `source` должен быть непустым
-после trim; `payload` — объект.
-`sm_create_input` проверяет точное имя `tool` без пробелов и поля инструмента:
+уровня отклоняются. Снятый `POST /api/v1/inputs` возвращает 404, а прежняя
+SQL-функция отсутствует. `sm_create_action` проверяет точное имя действия и поля `data`:
 
-| `tool` | Поля payload |
+| `action` | Поля `data` |
 | --- | --- |
 | `echo-test` | `message` необязателен: отсутствие означает `default echo`; если задан, это непустая, не состоящая из пробелов строка. |
 | `yt-dlp` | Обязательный `url`: абсолютный HTTP(S) URL с непустым host (для IDN используйте ASCII/Punycode). Проверка синтаксическая, без сетевого запроса. |
@@ -499,18 +561,12 @@ POST принимает ровно один JSON-документ до 1 MiB, н
 
 Отсутствующий необязательный ключ не равен явному `null`: `null` отклоняется.
 Дополнительные поля допускаются и сохраняются, строки не переписываются.
-Примеры: `{"tool":"echo-test"}`, `{"tool":"yt-dlp","url":"https://example.org/video"}`,
-`{"tool":"fabric","text":"Текст для обработки"}`. Неверный payload даёт 400
-без создания input/process/job. Эти правила не распространяются на прямой
+Неверные поля дают 400 без создания input/process/job. Эти правила не распространяются на прямой
 `INSERT INTO sm_inputs`, который остаётся под прежними ограничениями БД.
 Ошибки обработчиков имеют `{"error":"..."}`; стандартные ответы ServeMux
 (например 405) не обязаны иметь такой JSON.
 
-Пример input и ответа (ID ниже иллюстративные):
-
-```json
-{"source":"manual","payload":{"tool":"echo-test","message":"hello"}}
-```
+Пример ответа (ID иллюстративные):
 
 ```json
 {
@@ -539,7 +595,7 @@ Content-Type: application/json
 не принимается, в БД используется `api`. PostgreSQL принимает только активные
 пары с реализованными правилами: `echo-test`, `fabric`, `word-count`, `yt-dlp` версии 1.
 `data` должен быть объектом без ключа `tool` на верхнем уровне; БД подставляет
-`tool` из `action` и применяет те же правила полей, что и для legacy.
+`tool` из `action` и валидирует данные по таблице выше.
 Ошибки правил, включая активную v2 без валидатора, дают JSON 400 без вставок.
 Другие ошибки БД → JSON 500; истечение собственного DB-бюджета при ошибке
 → JSON 504. Ответ 201 имеет те же четыре поля, что и выше; существующие GET
@@ -646,9 +702,9 @@ MESSAGE='hello from operator'
 REQUEST_ID="manual-$(date +%s)"
 HEADERS="$(mktemp "${TMPDIR:-/tmp}/petar-headers.XXXXXX")"
 RESPONSE="$(jq -n --arg text "$MESSAGE" \
-  '{source:"manual",payload:{tool:"echo-test",message:$text}}' |
+  '{action:"echo-test",version:1,data:{message:$text}}' |
   curl -fsS -D "$HEADERS" -H "X-Request-ID: $REQUEST_ID" \
-    -H 'Content-Type: application/json' --data-binary @- "$API_BASE_URL/inputs")"
+    -H 'Content-Type: application/json' --data-binary @- "$API_BASE_URL/actions")"
 jq . <<<"$RESPONSE"
 PROCESS_ID="$(jq -er .process_id <<<"$RESPONSE")"
 grep -i '^X-Request-ID:' "$HEADERS"
@@ -719,8 +775,8 @@ sudo -u "$RUNNER_USER" env HOME="$RUNNER_HOME" PATH="$RUNNER_PATH" \
 read -r -p 'URL одного видео (не playlist): ' VIDEO_URL
 test -n "$VIDEO_URL"
 YTDLP_RESPONSE="$(jq -n --arg url "$VIDEO_URL" \
-  '{source:"manual",payload:{tool:"yt-dlp",url:$url}}' |
-  curl -fsS -H 'Content-Type: application/json' --data-binary @- "$API_BASE_URL/inputs")"
+  '{action:"yt-dlp",version:1,data:{url:$url}}' |
+  curl -fsS -H 'Content-Type: application/json' --data-binary @- "$API_BASE_URL/actions")"
 YTDLP_PROCESS="$(jq -er .process_id <<<"$YTDLP_RESPONSE")"
 YTDLP_DETAILS="$(wait_process "$YTDLP_PROCESS")"
 YTDLP_JOB="$(jq -er '.jobs[0].id' <<<"$YTDLP_DETAILS")"
@@ -730,10 +786,10 @@ jq . "$META"
 TEXT="$(jq -sr 'map([.title // "", .description // ""] | join("\n")) | join("\n") | .[0:16000]' "$META")"
 test -n "$TEXT"
 FABRIC_BODY="$(jq -n --arg text "$TEXT" \
-  '{source:"manual",payload:{tool:"fabric",pattern:"summarize",text:$text}}')"
+  '{action:"fabric",version:1,data:{pattern:"summarize",text:$text}}')"
 test "$(printf '%s' "$FABRIC_BODY" | wc -c)" -lt 1048576
 FABRIC_RESPONSE="$(curl -fsS -H 'Content-Type: application/json' \
-  --data-binary "$FABRIC_BODY" "$API_BASE_URL/inputs")"
+  --data-binary "$FABRIC_BODY" "$API_BASE_URL/actions")"
 FABRIC_PROCESS="$(jq -er .process_id <<<"$FABRIC_RESPONSE")"
 FABRIC_DETAILS="$(wait_process "$FABRIC_PROCESS")"
 FABRIC_JOB="$(jq -er '.jobs[0].id' <<<"$FABRIC_DETAILS")"
@@ -980,7 +1036,7 @@ find /opt/go-pet/spool -mindepth 1 -maxdepth 1 -exec mv -t "$SAVED_SPOOL" -- {} 
 tar -C /opt/go-pet -xzf "${BACKUP%.dump}-spool.tar.gz"
 ```
 
-Проверьте владельцев/ACL, таблицы и три функции командами bootstrap выше,
+Проверьте владельцев/ACL, таблицы и функции командами bootstrap выше,
 просмотрите незавершённые jobs и processing: они сами не возобновятся.
 Согласуйте их адресно через recovery перед запуском runner.
 Затем `docker start petar_app`, ограниченное ожидание readyz (как в recovery),
@@ -1035,35 +1091,13 @@ GOFLAGS='-count=1' ./scripts/quality-gate.sh
 ```
 
 `prepare` создаёт отсутствующую `petar_test`, ставит комментарий
-`petar:test-db:lifecycle=v1;state=preparing`, применяет только up
-000001 → 000002 → 000003 → 000004 → 000005 → 000006 → 000007 и после проверки схемы ставит `state=ready`.
-Повторный prepare готовой БД только проверяет её, не повторяет 000002.
-На уже готовой `petar_test` с `000003` `prepare` и `check` сообщат об отсутствии
-обязательных объектов, не обновляя схему автоматически. Для обновления без reset
-подтвердите цель и baseline, примените `000004.up` под общим `flock`, затем
-выполните шаг обновления до `000005` ниже.
-Для готовой `petar_test` на `000004` не используйте reset и не повторяйте старые
-миграции. Подтвердите локальную цель `petar_postgres` / `petar_user` / `petar_test`,
-PostgreSQL 18, ready-маркер, схему `000004`, отсутствие `public.sm_actions`
-и других подключений к `petar_test`. Примените только:
-
-```bash
-flock -x /opt/go-pet/postgres/.petar-test-db.lock \
-  docker exec -i petar_postgres psql -X -1 -v ON_ERROR_STOP=1 -U petar_user -d petar_test \
-  < postgres/migrations/000005_action_catalog.up.sql
-./scripts/test-db.sh check
-```
-
-Для подтверждённой `petar_test` на `000005` без объектов T24 и других подключений
-примените таким же способом под `flock` только `000006_universal_json_input.up.sql`,
-затем выполните шаг обновления до `000007` ниже. Не повторяйте старые миграции.
-
-Для готовой `petar_test` на `000006` подтвердите те же цель, ready-маркер и
-отсутствие других подключений под общим lock. Убедитесь, что CHECK
-`sm_jobs_tool_name_check` допускает только прежние три имени, а `word-count` v1
-отсутствует, затем примените аналогично под `flock` только `000007_word_count.up.sql`
-и выполните `./scripts/test-db.sh check`. `check` требует наличие пары, а не
-её включённость. Не делайте reset ради этого обновления.
+`petar:test-db:lifecycle=v2;state=preparing`, применяет только up `000001`–`000008`
+и после проверки ставит `petar:test-db:lifecycle=v2;state=ready`.
+Повторный prepare готовой БД только проверяет её. Guard требует новую функцию,
+отсутствие старой и наличие `word-count` v1 (не обязательно включённого).
+БД с прежним маркером `v1` не принимается, не обновляется и не удаляется
+автоматически. Для T28 используйте чистый одноразовый CI; обновление имеющейся
+тестовой БД требует отдельного согласования под общим `flock`.
 
 Существующая БД без маркера не «усыновляется»; частичная подготовка требует
 отдельного явного reset. Маркер защищает от случайного удаления, не от атак.
@@ -1257,6 +1291,21 @@ v1 у сохранённых заданий и успешный вызов `sm_c
 отдельном контейнере PostgreSQL 18 и собственном PGDATA проверяет цикл up → down
 → up, сохранность старого задания и атомарный отказ down при наличии истории
 `word-count`. Общие `petar_db`, `petar_test` и рабочий spool не используются.
+
+Для `000008` отдельно запускайте обе изолированные репетиции (не параллельно
+со штатным gate, долгий Go drill по умолчанию пропускается):
+
+```bash
+PETAR_T28_DRILL=1 go test -p=1 -count=1 -v -race -timeout 5m ./scripts \
+  -run '^TestRetireLegacyInputMigration$'
+bash scripts/check-retire-legacy-input.sh
+```
+
+Go-тест проверяет снимок строк и байтов до возобновления, up → down → up,
+вызов с отдельной ролью, сохранение цепочек и отказ `22023` без вставок.
+Вторая репетиция проверяет восстановление согласованного комплекта, HTTP,
+возобновление старой очереди и новый submit. Оба стенда работают без рабочей БД
+или рабочего spool; это не гарантия exactly-once за пределами проверенного сценария.
 
 Проверки внешних systemd, proxy, DokuWiki и реальных CLI требуют отдельного
 deployment-окружения; наличие примеров в README не означает, что они установлены.

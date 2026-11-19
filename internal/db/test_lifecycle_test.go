@@ -311,6 +311,7 @@ var testMigrationNames = []string{
 	"000005_action_catalog.up.sql",
 	"000006_universal_json_input.up.sql",
 	"000007_word_count.up.sql",
+	"000008_retire_legacy_input.up.sql",
 }
 
 func TestLifecycleMigrationOrder(t *testing.T) {
@@ -322,6 +323,7 @@ func TestLifecycleMigrationOrder(t *testing.T) {
 		"000005_action_catalog.up.sql",
 		"000006_universal_json_input.up.sql",
 		"000007_word_count.up.sql",
+		"000008_retire_legacy_input.up.sql",
 	}
 	if !slices.Equal(testMigrationNames, want) {
 		t.Fatalf("migration order = %v, want %v", testMigrationNames, want)
@@ -580,7 +582,7 @@ func TestLifecycleFailureNeverMarksReady(t *testing.T) {
 }
 
 func TestLifecycleUnownedAndPreparingRefused(t *testing.T) {
-	for _, marker := range []string{"", testPreparingMarker, "petar:test-db:lifecycle=v2;state=ready"} {
+	for _, marker := range []string{"", testPreparingMarker, "petar:test-db:lifecycle=v1;state=ready", "petar:test-db:lifecycle=v999;state=ready"} {
 		for _, command := range []string{"prepare", "check", "gate"} {
 			t.Run(command+"/"+marker, func(t *testing.T) {
 				store := &fakeTestLifecycle{exists: true, value: marker}

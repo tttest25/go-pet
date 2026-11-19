@@ -2,3 +2,5 @@ postgres/data/
 postgres/data
 postgres/.ci-postgres.*
 postgres/.fresh-bootstrap.*
+postgres/.t28-migration.*
+postgres/.t28-cutover.*

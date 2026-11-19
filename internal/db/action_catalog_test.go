@@ -47,7 +47,7 @@ func TestActionCatalogInitialEntries(t *testing.T) {
 	}
 }
 
-func TestActionCatalogDisabledRejectsInput(t *testing.T) {
+func TestActionCatalogDisabledRejectsAction(t *testing.T) {
 	ctx := queueTestContext(t)
 	conn, err := pgx.Connect(ctx, requireTestDSN(ctx, t))
 	if err != nil {
@@ -66,11 +66,12 @@ func TestActionCatalogDisabledRejectsInput(t *testing.T) {
 		}
 	}()
 
-	const createInput = `SELECT input_id, process_id, status FROM public.sm_create_input($1, '{"tool":"echo-test"}')`
-	source := "t22-catalog-" + uuid.NewString()
+	const createAction = `SELECT input_id, process_id, status FROM public.sm_create_action('echo-test', 1,
+		jsonb_build_object('_test_fixture', $1::text))`
+	marker := "t22-catalog-" + uuid.NewString()
 	var inputID, processID, jobID uuid.UUID
 	var status string
-	if err := tx.QueryRow(ctx, createInput, source).Scan(&inputID, &processID, &status); err != nil || status != "new" {
+	if err := tx.QueryRow(ctx, createAction, marker).Scan(&inputID, &processID, &status); err != nil || status != "new" {
 		t.Fatalf("create control input: status %q, error %v", status, err)
 	}
 	var processes, jobs int
@@ -125,12 +126,12 @@ func TestActionCatalogDisabledRejectsInput(t *testing.T) {
 	if _, err := tx.Exec(ctx, `SAVEPOINT attempt`); err != nil {
 		t.Fatalf("create attempt savepoint: %v", err)
 	}
-	attempt := source + "-rejected"
+	attempt := marker + "-rejected"
 	var rejectedInput, rejectedProcess uuid.UUID
 	var rejectedStatus string
-	err = tx.QueryRow(ctx, createInput, attempt).Scan(&rejectedInput, &rejectedProcess, &rejectedStatus)
+	err = tx.QueryRow(ctx, createAction, attempt).Scan(&rejectedInput, &rejectedProcess, &rejectedStatus)
 	if err == nil {
-		t.Fatalf("sm_create_input accepted a valid payload for disabled echo-test v1 (input %s)", rejectedInput)
+		t.Fatalf("sm_create_action accepted valid data for disabled echo-test v1 (input %s)", rejectedInput)
 	}
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != "22023" {
@@ -141,7 +142,7 @@ func TestActionCatalogDisabledRejectsInput(t *testing.T) {
 	}
 	var enabled, attemptExists bool
 	if err := tx.QueryRow(ctx, `SELECT enabled,
-		EXISTS (SELECT FROM public.sm_inputs WHERE source=$1)
+		EXISTS (SELECT FROM public.sm_inputs WHERE source='api' AND payload->>'_test_fixture'=$1)
 		FROM public.sm_actions WHERE action='echo-test' AND version=1`, attempt).
 		Scan(&enabled, &attemptExists); err != nil || enabled || attemptExists {
 		t.Fatalf("after rejected attempt: enabled=%t input exists=%t, error %v", enabled, attemptExists, err)

@@ -28,7 +28,8 @@ chmod 0755 "$data"
 container=$(docker create --name "$name" --network none --shm-size 128m --memory 450m \
     -e POSTGRES_USER=petar_user -e POSTGRES_PASSWORD=petar_password -e POSTGRES_DB=petar_db \
     --mount "type=bind,src=$data,dst=/var/lib/postgresql" \
-    --mount "type=bind,src=$root/postgres/migrations,dst=/docker-entrypoint-initdb.d,readonly" \
+    --mount "type=bind,src=$root/postgres/bootstrap.sh,dst=/docker-entrypoint-initdb.d/10-petar.sh,readonly" \
+    --mount "type=bind,src=$root/postgres/migrations,dst=/migrations,readonly" \
     --mount "type=bind,src=$root/postgres/postgresql.conf,dst=/etc/postgresql/postgresql.conf,readonly" \
     "$image" postgres -c config_file=/etc/postgresql/postgresql.conf)
 docker start "$container"
@@ -59,7 +60,7 @@ SELECT extname FROM pg_extension ORDER BY extname;
 SELECT srvname FROM pg_foreign_server;
 SELECT to_regclass('sm_inputs'), to_regclass('sm_processes'), to_regclass('sm_jobs'),
        to_regclass('sm_job_logs'), to_regclass('sm_outputs'), to_regclass('public.sm_actions');
-SELECT to_regprocedure('sm_create_input(text,jsonb)'),
+SELECT to_regprocedure('public.sm_create_input(text,jsonb)'),
        to_regprocedure('public.sm_create_action(text,integer,jsonb)'),
        to_regprocedure('sm_validate_tool_payload(jsonb)'),
        to_regprocedure('sm_pick_next_job()'),
@@ -81,7 +82,7 @@ SELECT current_setting('server_version_num')::int BETWEEN 180000 AND 189999
           AND bool_or((action, version) = ('word-count', 1))
           AND bool_or((action, version) = ('yt-dlp', 1))
         FROM public.sm_actions WHERE enabled)
-   AND to_regprocedure('public.sm_create_input(text,jsonb)') IS NOT NULL
+   AND to_regprocedure('public.sm_create_input(text,jsonb)') IS NULL
    AND to_regprocedure('public.sm_create_action(text,integer,jsonb)') IS NOT NULL
    AND EXISTS (SELECT FROM information_schema.columns
         WHERE table_schema='public' AND table_name='sm_jobs' AND column_name='action_version'
@@ -100,11 +101,11 @@ SELECT current_setting('server_version_num')::int BETWEEN 180000 AND 189999
     DO $$ BEGIN RAISE EXCEPTION 'fresh bootstrap schema check failed'; END $$;
 \endif
 BEGIN;
-SELECT * FROM sm_create_input('fresh-bootstrap-probe','{"tool":"echo-test"}') \gset
+SELECT * FROM public.sm_create_action('echo-test',1,'{}') \gset
 SELECT * FROM public.sm_create_action('word-count',1,'{"text":"один два три"}') \gset action_
 SELECT :'input_id' AS input_id, :'process_id' AS process_id, :'status' AS status;
 WITH expected(input_id, process_id, status, source, payload) AS (
-    VALUES (:'input_id'::uuid, :'process_id'::uuid, :'status', 'fresh-bootstrap-probe', '{"tool":"echo-test"}'::jsonb),
+    VALUES (:'input_id'::uuid, :'process_id'::uuid, :'status', 'api', '{"tool":"echo-test"}'::jsonb),
            (:'action_input_id'::uuid, :'action_process_id'::uuid, :'action_status', 'api',
             '{"tool":"word-count","text":"один два три"}'::jsonb)
 )

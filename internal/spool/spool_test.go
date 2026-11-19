@@ -761,16 +761,17 @@ func TestSpoolWorkerIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(setupCtx)
-	var processID uuid.UUID
-	if err := tx.QueryRow(setupCtx, `SELECT process_id FROM sm_create_input($1,$2)`, source,
-		`{"tool":"echo-test","message":"integration"}`).Scan(&processID); err != nil {
+	var inputID uuid.UUID
+	if err := tx.QueryRow(setupCtx, `INSERT INTO sm_inputs (source, payload)
+		VALUES ($1, '{"tool":"echo-test","message":"integration"}') RETURNING id`, source).Scan(&inputID); err != nil {
 		t.Fatal(err)
 	}
 
 	var jobID uuid.UUID
 	var version int
-	if err := tx.QueryRow(setupCtx, `UPDATE sm_jobs SET action_version=2 WHERE process_id=$1
-		RETURNING id, action_version`, processID).Scan(&jobID, &version); err != nil {
+	if err := tx.QueryRow(setupCtx, `UPDATE sm_jobs SET action_version=2
+		WHERE process_id IN (SELECT id FROM sm_processes WHERE input_id=$1)
+		RETURNING id, action_version`, inputID).Scan(&jobID, &version); err != nil {
 		t.Fatalf("set integration job version: %v", err)
 	}
 	if err := tx.Commit(setupCtx); err != nil {

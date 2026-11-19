@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"reflect"
 	"sort"
@@ -629,24 +630,16 @@ func (e *queueTestEnv) createJob(
 ) testJobIDs {
 	t.Helper()
 
-	created, err := e.database.CreateInput(ctx, e.source, payload)
-	if err != nil {
-		t.Fatalf("create input: %v", err)
+	var inputID uuid.UUID
+	if err := e.pool.QueryRow(ctx, `INSERT INTO sm_inputs (source, payload)
+		VALUES ($1, $2) RETURNING id`, e.source, payload).Scan(&inputID); err != nil {
+		t.Fatalf("insert input fixture: %v", err)
 	}
-	if created.InputID == uuid.Nil || created.ProcessID == uuid.Nil {
-		t.Fatalf("CreateInput returned a nil UUID: %+v", created)
-	}
-
-	ids := testJobIDs{
-		inputID:   created.InputID,
-		processID: created.ProcessID,
-	}
-	if err := e.pool.QueryRow(
-		ctx,
-		"SELECT id FROM sm_jobs WHERE process_id = $1",
-		created.ProcessID,
-	).Scan(&ids.jobID); err != nil {
-		t.Fatalf("query generated job: %v", err)
+	ids := testJobIDs{inputID: inputID}
+	if err := e.pool.QueryRow(ctx, `SELECT p.id, j.id
+		FROM sm_processes p JOIN sm_jobs j ON j.process_id = p.id
+		WHERE p.input_id = $1`, inputID).Scan(&ids.processID, &ids.jobID); err != nil {
+		t.Fatalf("query generated process and job: %v", err)
 	}
 
 	return ids
@@ -714,38 +707,53 @@ func requireJSONEqual(t *testing.T, got, want json.RawMessage) {
 	}
 }
 
-func TestCreateInputReturnsCreatedProcess(t *testing.T) {
-	env := newQueueTestEnv(t, "step10-test-create-input")
+func (e *queueTestEnv) echoActionData(t *testing.T, message string) (data json.RawMessage, marker string) {
+	t.Helper()
+	// The marker gives cleanup ownership even if an insert succeeds but its
+	// returned IDs are unavailable.
+	marker = uuid.NewString()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := e.pool.Exec(ctx, `DELETE FROM sm_inputs WHERE source='api' AND payload->>'_test_fixture'=$1`, marker); err != nil {
+			t.Errorf("clean up test action: %v", err)
+		}
+	})
+	return json.RawMessage(fmt.Sprintf(`{"message":%q,"_test_fixture":%q}`, message, marker)), marker
+}
+
+func TestCreateActionReturnsCreatedProcess(t *testing.T) {
+	env := newQueueTestEnv(t, "create-action-process-"+uuid.NewString())
 	ctx := queueTestContext(t)
 
-	created, err := env.database.CreateInput(
-		ctx,
-		env.source,
-		json.RawMessage(`{"tool":"echo-test","message":"step10"}`),
-	)
+	data, _ := env.echoActionData(t, "step10")
+	created, err := env.database.CreateAction(ctx, "echo-test", 1, data)
 	if err != nil {
-		t.Fatalf("create input: %v", err)
+		t.Fatalf("create action: %v", err)
 	}
 	if created.InputID == uuid.Nil {
-		t.Fatal("CreateInput returned a nil input UUID")
+		t.Fatal("CreateAction returned a nil input UUID")
 	}
 	if created.ProcessID == uuid.Nil {
-		t.Fatal("CreateInput returned a nil process UUID")
+		t.Fatal("CreateAction returned a nil process UUID")
 	}
 	if created.Status != "new" {
 		t.Fatalf("input status = %q, want new", created.Status)
 	}
 
-	var storedStatus string
+	var storedStatus, source string
 	if err := env.pool.QueryRow(
 		ctx,
-		"SELECT status FROM sm_inputs WHERE id = $1",
+		"SELECT status, source FROM sm_inputs WHERE id = $1",
 		created.InputID,
-	).Scan(&storedStatus); err != nil {
+	).Scan(&storedStatus, &source); err != nil {
 		t.Fatalf("query stored input: %v", err)
 	}
 	if storedStatus != created.Status {
 		t.Fatalf("stored status = %q, want %q", storedStatus, created.Status)
+	}
+	if source != "api" {
+		t.Fatalf("stored source = %q, want api", source)
 	}
 
 	var processID uuid.UUID
@@ -761,16 +769,10 @@ func TestCreateInputReturnsCreatedProcess(t *testing.T) {
 	}
 }
 
-func TestCreateInputRollsBackWhenProcessIsMissing(t *testing.T) {
-	env := newQueueTestEnv(t, "step10-test-create-input-without-process")
+func TestCreateActionRollsBackWhenProcessIsMissing(t *testing.T) {
+	env := newQueueTestEnv(t, "create-action-without-process-"+uuid.NewString())
 	ctx := queueTestContext(t)
 
-	if _, err := env.pool.Exec(
-		ctx,
-		"ALTER TABLE sm_inputs DISABLE TRIGGER trg_sm_inputs_after_insert",
-	); err != nil {
-		t.Fatalf("disable input trigger: %v", err)
-	}
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -782,27 +784,28 @@ func TestCreateInputRollsBackWhenProcessIsMissing(t *testing.T) {
 			t.Errorf("enable input trigger: %v", err)
 		}
 	})
-
-	created, err := env.database.CreateInput(
+	if _, err := env.pool.Exec(
 		ctx,
-		env.source,
-		json.RawMessage(`{"tool":"echo-test"}`),
-	)
-	if err == nil {
-		t.Fatal("CreateInput succeeded without a generated process")
+		"ALTER TABLE sm_inputs DISABLE TRIGGER trg_sm_inputs_after_insert",
+	); err != nil {
+		t.Fatalf("disable input trigger: %v", err)
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		t.Fatalf("CreateInput error = %v, want wrapped pgx.ErrNoRows", err)
+
+	data, marker := env.echoActionData(t, "missing process")
+	created, err := env.database.CreateAction(ctx, "echo-test", 1, data)
+	var pgErr *pgconn.PgError
+	if !errors.Is(err, pgx.ErrNoRows) || !errors.As(err, &pgErr) || pgErr.Code != "P0002" {
+		t.Fatalf("CreateAction error = %v, want wrapped pgx.ErrNoRows and SQLSTATE P0002", err)
 	}
 	if created != (db.CreatedInput{}) {
-		t.Fatalf("CreateInput returned data after rollback: %+v", created)
+		t.Fatalf("CreateAction returned data after rollback: %+v", created)
 	}
 
 	var inputCount int
 	if err := env.pool.QueryRow(
 		ctx,
-		"SELECT COUNT(*) FROM sm_inputs WHERE source = $1",
-		env.source,
+		`SELECT COUNT(*) FROM sm_inputs WHERE payload->>'_test_fixture' = $1`,
+		marker,
 	).Scan(&inputCount); err != nil {
 		t.Fatalf("count rolled back inputs: %v", err)
 	}
@@ -811,11 +814,18 @@ func TestCreateInputRollsBackWhenProcessIsMissing(t *testing.T) {
 	}
 }
 
-func TestCreateInputAndPickNextJob(t *testing.T) {
-	env := newQueueTestEnv(t, "step3-test-create-pick")
+func TestCreateActionAndPickNextJob(t *testing.T) {
+	env := newQueueTestEnv(t, "create-action-pick-"+uuid.NewString())
 	ctx := queueTestContext(t)
-	payload := json.RawMessage(`{"tool":"echo-test","message":"hello"}`)
-	ids := env.createJob(t, ctx, payload)
+	data, marker := env.echoActionData(t, "hello")
+	created, err := env.database.CreateAction(ctx, "echo-test", 1, data)
+	if err != nil {
+		t.Fatalf("create action: %v", err)
+	}
+	var jobID uuid.UUID
+	if err := env.pool.QueryRow(ctx, "SELECT id FROM sm_jobs WHERE process_id = $1", created.ProcessID).Scan(&jobID); err != nil {
+		t.Fatalf("query generated job: %v", err)
+	}
 
 	job, err := env.database.PickNextJob(ctx)
 	if err != nil {
@@ -825,16 +835,19 @@ func TestCreateInputAndPickNextJob(t *testing.T) {
 		t.Fatal("PickNextJob returned no job")
 	}
 
-	if job.ID != ids.jobID {
-		t.Fatalf("job ID = %s, want %s", job.ID, ids.jobID)
+	if job.ID != jobID {
+		t.Fatalf("job ID = %s, want %s", job.ID, jobID)
 	}
-	if job.ProcessID != ids.processID {
-		t.Fatalf("process ID = %s, want %s", job.ProcessID, ids.processID)
+	if job.ProcessID != created.ProcessID {
+		t.Fatalf("process ID = %s, want %s", job.ProcessID, created.ProcessID)
 	}
 	if job.ToolName != "echo-test" {
 		t.Fatalf("tool name = %q, want echo-test", job.ToolName)
 	}
-	requireJSONEqual(t, job.Payload, payload)
+	requireJSONEqual(t, job.Payload, json.RawMessage(fmt.Sprintf(`{"tool":"echo-test","message":"hello","_test_fixture":%q}`, marker)))
+	if job.ActionVersion != 1 {
+		t.Fatalf("action version = %d, want 1", job.ActionVersion)
+	}
 	if job.OldStatus != db.StatusPending {
 		t.Fatalf("old status = %q, want %q", job.OldStatus, db.StatusPending)
 	}
@@ -842,7 +855,7 @@ func TestCreateInputAndPickNextJob(t *testing.T) {
 		t.Fatalf("status = %q, want %q", job.Status, db.StatusDispatched)
 	}
 
-	requireProcessState(t, ctx, env.pool, ids.processID, "running")
+	requireProcessState(t, ctx, env.pool, created.ProcessID, "running")
 
 	var transition statusTransition
 	if err := env.pool.QueryRow(
@@ -850,7 +863,7 @@ func TestCreateInputAndPickNextJob(t *testing.T) {
 		`SELECT old_status, new_status
 		 FROM sm_job_logs
 		 WHERE job_id = $1`,
-		ids.jobID,
+		jobID,
 	).Scan(&transition.oldStatus, &transition.newStatus); err != nil {
 		t.Fatalf("query dispatch audit log: %v", err)
 	}
@@ -1412,9 +1425,9 @@ func TestDBStateFunctions(t *testing.T) {
 		t.Helper()
 		var ids testJobIDs
 		var status string
-		if err := tx.QueryRow(ctx, "SELECT * FROM sm_create_input($1, $2)",
-			env.source, payload).Scan(&ids.inputID, &ids.processID, &status); err != nil {
-			t.Fatalf("call sm_create_input: %v", err)
+		if err := tx.QueryRow(ctx, `SELECT * FROM public.sm_create_action('echo-test', 1, '{"message":"state functions"}')`).
+			Scan(&ids.inputID, &ids.processID, &status); err != nil {
+			t.Fatalf("call sm_create_action: %v", err)
 		}
 		if ids.inputID == uuid.Nil || ids.processID == uuid.Nil || status != "new" {
 			t.Fatalf("created input = %+v, status = %q", ids, status)
@@ -1536,31 +1549,4 @@ func TestDBStateFunctions(t *testing.T) {
 	if err := tx.Rollback(ctx); err != nil {
 		t.Fatalf("roll back queue isolation: %v", err)
 	}
-
-	t.Run("missing process rolls back input", func(t *testing.T) {
-		rollbackSource := env.source + "-rollback"
-		// Register restoration before disabling the trigger, including on ambiguous errors.
-		t.Cleanup(func() {
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if _, err := env.pool.Exec(cleanupCtx, "ALTER TABLE sm_inputs ENABLE TRIGGER trg_sm_inputs_after_insert"); err != nil {
-				t.Errorf("enable input trigger: %v", err)
-			}
-			if _, err := env.pool.Exec(cleanupCtx, "DELETE FROM sm_inputs WHERE source = $1", rollbackSource); err != nil {
-				t.Errorf("clean up trigger test input: %v", err)
-			}
-		})
-		if _, err := env.pool.Exec(ctx, "ALTER TABLE sm_inputs DISABLE TRIGGER trg_sm_inputs_after_insert"); err != nil {
-			t.Fatalf("disable input trigger: %v", err)
-		}
-		var inputID, processID uuid.UUID
-		var status string
-		err := env.pool.QueryRow(ctx, "SELECT * FROM sm_create_input($1, $2)", rollbackSource, payload).
-			Scan(&inputID, &processID, &status)
-		requireSQLState(t, err, "P0002")
-		var count int
-		if err := env.pool.QueryRow(ctx, "SELECT count(*) FROM sm_inputs WHERE source = $1", rollbackSource).Scan(&count); err != nil || count != 0 {
-			t.Fatalf("rolled back input count = %d, err = %v; want 0", count, err)
-		}
-	})
 }

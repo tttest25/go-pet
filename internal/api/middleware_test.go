@@ -47,7 +47,7 @@ func TestRequestIDAndLoggingMiddleware(t *testing.T) {
 	})
 
 	t.Run("preserves existing request id and extracts x-forwarded-for ip", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/inputs", nil)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/actions", nil)
 		req.Header.Set("X-Request-ID", "custom-request-id-123")
 		req.Header.Set("X-Forwarded-For", "203.0.113.195, 70.41.3.18")
 		rec := httptest.NewRecorder()

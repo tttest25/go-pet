@@ -25,32 +25,29 @@ import (
 )
 
 type fakeDatabase struct {
-	getProcessResult                   db.ProcessDetails
-	getProcessErr                      error
-	listJobsResult                     []db.JobDetails
-	listJobsErr                        error
-	getJobStatus                       func(context.Context, uuid.UUID) (db.Status, error)
-	listActionsResult                  []db.ActionVersion
-	listActionsErr                     error
-	listActionsContext                 context.Context
-	getProcessCalls, listJobsCalls     int
-	getProcessID                       uuid.UUID
-	listJobsFilter                     db.JobFilter
-	getProcessContext, listJobsContext context.Context
-	pingErr                            error
-	createInputErr                     error
-	createActionErr                    error
-	updateErr                          error
+	getProcessResult                    db.ProcessDetails
+	getProcessErr                       error
+	listJobsResult                      []db.JobDetails
+	listJobsErr                         error
+	getJobStatus                        func(context.Context, uuid.UUID) (db.Status, error)
+	listActionsResult                   []db.ActionVersion
+	listActionsErr                      error
+	listActionsContext                  context.Context
+	getProcessCalls, listJobsCalls      int
+	getJobStatusCalls, listActionsCalls int
+	getProcessID                        uuid.UUID
+	listJobsFilter                      db.JobFilter
+	getProcessContext, listJobsContext  context.Context
+	pingErr                             error
+	createActionErr                     error
+	updateErr                           error
 
 	createdInput db.CreatedInput
 
 	pingCalls         int
-	createInputCalls  int
 	createActionCalls int
 	updateCalls       int
 
-	source     string
-	payload    json.RawMessage
 	action     string
 	version    int32
 	data       json.RawMessage
@@ -83,6 +80,7 @@ func (f *fakeDatabase) ListJobs(ctx context.Context, filter db.JobFilter) ([]db.
 }
 
 func (f *fakeDatabase) GetJobStatus(ctx context.Context, id uuid.UUID) (db.Status, error) {
+	f.getJobStatusCalls++
 	return f.getJobStatus(ctx, id)
 }
 
@@ -92,22 +90,9 @@ func (f *fakeDatabase) Ping(context.Context) error {
 }
 
 func (f *fakeDatabase) ListActions(ctx context.Context) ([]db.ActionVersion, error) {
+	f.listActionsCalls++
 	f.listActionsContext = ctx
 	return f.listActionsResult, f.listActionsErr
-}
-
-func (f *fakeDatabase) CreateInput(
-	_ context.Context,
-	source string,
-	payload json.RawMessage,
-) (db.CreatedInput, error) {
-	f.createInputCalls++
-	f.source = source
-	f.payload = payload
-	if f.createInputErr != nil {
-		return db.CreatedInput{}, f.createInputErr
-	}
-	return f.createdInput, nil
 }
 
 func (f *fakeDatabase) CreateAction(_ context.Context, action string, version int32, data json.RawMessage) (db.CreatedInput, error) {
@@ -234,6 +219,20 @@ func TestReadyz(t *testing.T) {
 	})
 }
 
+func TestRetiredInputRoute(t *testing.T) {
+	f := newFakeDatabase()
+	response := performRequest(newServer(f, apiTestLogger()), http.MethodPost, "/api/v1/inputs",
+		`{"source":"manual","payload":{"tool":"echo-test","message":"hello"}}`)
+
+	if response.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404; body = %s", response.Code, response.Body)
+	}
+	if calls := f.pingCalls + f.createActionCalls + f.updateCalls +
+		f.getProcessCalls + f.listJobsCalls + f.getJobStatusCalls + f.listActionsCalls; calls != 0 {
+		t.Errorf("database calls = %d, want 0", calls)
+	}
+}
+
 func TestCreateActionForwardsRawData(t *testing.T) {
 	f := newFakeDatabase()
 	const data = `{ "extra": 9007199254740993, "message": "\u0068ello" }`
@@ -243,9 +242,9 @@ func TestCreateActionForwardsRawData(t *testing.T) {
 		"input_id": f.createdInput.InputID.String(), "process_id": f.createdInput.ProcessID.String(),
 		"status": "new", "id": f.createdInput.InputID.String(),
 	})
-	if f.createActionCalls != 1 || f.action != "echo-test" || f.version != 1 || string(f.data) != data || f.createInputCalls != 0 {
-		t.Fatalf("action calls=%d action=%q version=%d data=%s legacy calls=%d",
-			f.createActionCalls, f.action, f.version, f.data, f.createInputCalls)
+	if f.createActionCalls != 1 || f.action != "echo-test" || f.version != 1 || string(f.data) != data {
+		t.Fatalf("action calls=%d action=%q version=%d data=%s",
+			f.createActionCalls, f.action, f.version, f.data)
 	}
 }
 
@@ -256,6 +255,7 @@ func TestCreateActionEnvelope(t *testing.T) {
 		"empty": "", "broken": `{`, "second JSON": `{"action":"echo-test","version":1,"data":{}} {}`,
 		"over limit": atLimit + " ", "array": `[]`, "null envelope": `null`,
 		"source":          `{"action":"echo-test","version":1,"data":{},"source":"manual"}`,
+		"unknown field":   `{"action":"echo-test","version":1,"data":{},"extra":true}`,
 		"missing data":    `{"action":"echo-test","version":1}`,
 		"missing action":  `{"version":1,"data":{}}`,
 		"empty action":    `{"action":"","version":1,"data":{}}`,
@@ -270,8 +270,8 @@ func TestCreateActionEnvelope(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			f := newFakeDatabase()
 			r := performRequest(newServer(f, apiTestLogger()), "POST", "/api/v1/actions", body)
-			if r.Code != 400 || f.createActionCalls != 0 || f.createInputCalls != 0 {
-				t.Fatalf("status=%d action calls=%d legacy calls=%d", r.Code, f.createActionCalls, f.createInputCalls)
+			if r.Code != 400 || f.createActionCalls != 0 {
+				t.Fatalf("status=%d action calls=%d", r.Code, f.createActionCalls)
 			}
 			requireJSONContentType(t, r)
 			var response errorResponse
@@ -309,259 +309,16 @@ func TestCreateActionErrors(t *testing.T) {
 	}{
 		{fmt.Errorf("private database details: %w", db.ErrInvalidInput), 400, "invalid action input"},
 		{errors.New("private database details"), 500, "failed to create action"},
+		{fmt.Errorf("private process lookup failure: %w", pgx.ErrNoRows), 500, "failed to create action"},
+		{fmt.Errorf("private callback failure: %w", db.ErrInvalidCallbackStatus), 500, "failed to create action"},
 	} {
 		f := newFakeDatabase()
 		f.createActionErr = tc.err
 		r := performRequest(newServer(f, apiTestLogger()), "POST", "/api/v1/actions", `{"action":"echo-test","version":1,"data":{}}`)
 		requireReadJSON(t, r, tc.status, map[string]string{"error": tc.message})
-		if f.createActionCalls != 1 || f.createInputCalls != 0 {
-			t.Fatalf("action calls=%d legacy calls=%d", f.createActionCalls, f.createInputCalls)
+		if f.createActionCalls != 1 {
+			t.Fatalf("action calls=%d, want 1", f.createActionCalls)
 		}
-	}
-}
-
-func TestCreateInput(t *testing.T) {
-	database := newFakeDatabase()
-	server := newServer(database, apiTestLogger())
-	body := `{"source":"manual","payload":{"tool":"echo-test","message":"hello"}}`
-
-	response := performRequest(server, http.MethodPost, "/api/v1/inputs", body)
-	if response.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201: %s", response.Code, response.Body)
-	}
-	requireJSONContentType(t, response)
-
-	var responseBody createInputResponse
-	if err := json.Unmarshal(response.Body.Bytes(), &responseBody); err != nil {
-		t.Fatalf("decode create response: %v", err)
-	}
-	if responseBody.InputID == uuid.Nil || responseBody.ProcessID == uuid.Nil {
-		t.Fatalf("response contains nil UUID: %+v", responseBody)
-	}
-	if responseBody.InputID != database.createdInput.InputID {
-		t.Fatalf(
-			"response input ID = %s, want %s",
-			responseBody.InputID,
-			database.createdInput.InputID,
-		)
-	}
-	if responseBody.ProcessID != database.createdInput.ProcessID {
-		t.Fatalf(
-			"response process ID = %s, want %s",
-			responseBody.ProcessID,
-			database.createdInput.ProcessID,
-		)
-	}
-	if responseBody.Status != "new" {
-		t.Fatalf("response status = %q, want new", responseBody.Status)
-	}
-	if responseBody.ID != responseBody.InputID {
-		t.Fatalf("legacy response ID = %s, want input ID %s", responseBody.ID, responseBody.InputID)
-	}
-
-	var responseFields map[string]json.RawMessage
-	if err := json.Unmarshal(response.Body.Bytes(), &responseFields); err != nil {
-		t.Fatalf("decode create response fields: %v", err)
-	}
-	if len(responseFields) != 4 {
-		t.Fatalf("response fields = %v, want exactly four fields", responseFields)
-	}
-	for _, field := range []string{"input_id", "process_id", "status", "id"} {
-		if _, ok := responseFields[field]; !ok {
-			t.Errorf("response field %q is missing", field)
-		}
-	}
-
-	if database.createInputCalls != 1 {
-		t.Fatalf("CreateInput calls = %d, want 1", database.createInputCalls)
-	}
-	if database.source != "manual" {
-		t.Fatalf("source = %q, want manual", database.source)
-	}
-
-	var payload map[string]any
-	if err := json.Unmarshal(database.payload, &payload); err != nil {
-		t.Fatalf("database received invalid payload: %v", err)
-	}
-	if payload["tool"] != "echo-test" || payload["message"] != "hello" {
-		t.Fatalf("database payload = %#v", payload)
-	}
-}
-
-func TestCreateInputValidation(t *testing.T) {
-	tests := []struct {
-		name string
-		body string
-	}{
-		{name: "empty body", body: ""},
-		{name: "malformed JSON", body: `{"`},
-		{
-			name: "oversized body",
-			body: `{"source":"manual","payload":{"tool":"echo-test","message":"` + strings.Repeat("x", 1<<20) + `"}}`,
-		},
-		{
-			name: "multiple documents",
-			body: `{"source":"manual","payload":{"tool":"echo-test"}} {}`,
-		},
-		{
-			name: "unknown field",
-			body: `{"source":"manual","payload":{"tool":"echo-test"},"extra":true}`,
-		},
-		{
-			name: "missing source",
-			body: `{"payload":{"tool":"echo-test"}}`,
-		},
-		{
-			name: "blank source",
-			body: `{"source":"  ","payload":{"tool":"echo-test"}}`,
-		},
-		{name: "missing payload", body: `{"source":"manual"}`},
-		{
-			name: "null payload",
-			body: `{"source":"manual","payload":null}`,
-		},
-		{
-			name: "payload is string",
-			body: `{"source":"manual","payload":"echo-test"}`,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			database := newFakeDatabase()
-			server := newServer(database, apiTestLogger())
-			response := performRequest(
-				server,
-				http.MethodPost,
-				"/api/v1/inputs",
-				test.body,
-			)
-
-			if response.Code != http.StatusBadRequest {
-				t.Fatalf("status = %d, want 400: %s", response.Code, response.Body)
-			}
-			requireJSONContentType(t, response)
-			if database.createInputCalls != 0 {
-				t.Fatal("invalid input reached CreateInput")
-			}
-		})
-	}
-}
-
-func TestCreateInputDatabaseError(t *testing.T) {
-	tests := []struct {
-		name string
-		err  error
-		want int
-	}{
-		{
-			name: "insert failure",
-			err:  errors.New("sensitive insert failure"),
-			want: http.StatusInternalServerError,
-		},
-		{
-			name: "created process is missing",
-			err:  fmt.Errorf("sensitive process lookup failure: %w", pgx.ErrNoRows),
-			want: http.StatusInternalServerError,
-		},
-		{
-			name: "wrapped invalid input",
-			err:  fmt.Errorf("sensitive validator details: %w", db.ErrInvalidInput),
-			want: http.StatusBadRequest,
-		},
-		{
-			name: "callback sentinel is not an input error",
-			err:  fmt.Errorf("sensitive callback details: %w", db.ErrInvalidCallbackStatus),
-			want: http.StatusInternalServerError,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			database := newFakeDatabase()
-			database.createInputErr = test.err
-			server := newServer(database, apiTestLogger())
-
-			response := performRequest(
-				server,
-				http.MethodPost,
-				"/api/v1/inputs",
-				`{"source":"manual","payload":{"tool":"echo-test"}}`,
-			)
-			if response.Code != test.want {
-				t.Fatalf("status = %d, want %d", response.Code, test.want)
-			}
-			if strings.Contains(response.Body.String(), "sensitive") {
-				t.Fatalf("response leaked internal error: %s", response.Body)
-			}
-			if database.createInputCalls != 1 {
-				t.Fatalf("CreateInput calls = %d, want 1", database.createInputCalls)
-			}
-		})
-	}
-}
-
-func TestCreateInputPayloadIntegration(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	dsn := requireTestDSN(ctx, t)
-	database, err := db.New(ctx, dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer database.Close()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Close()
-	server := newServer(database, apiTestLogger())
-
-	for _, tc := range []struct {
-		name, payload string
-		want          int
-	}{
-		{"default echo", `{"tool":"echo-test"}`, 201},
-		{"web URL", `{"tool":"yt-dlp","url":"https://example.org/video"}`, 201},
-		{"default pattern", `{"tool":"fabric","text":"body"}`, 201},
-		{"missing tool", `{"message":"hello"}`, 400},
-		{"unknown tool", `{"tool":"unsupported"}`, 400},
-		{"padded tool", `{"tool":" echo-test "}`, 400},
-		{"null message", `{"tool":"echo-test","message":null}`, 400},
-		{"missing text", `{"tool":"fabric"}`, 400},
-		{"invalid pattern", `{"tool":"fabric","text":"body","pattern":"../x"}`, 400},
-		{"invalid URL", `{"tool":"yt-dlp","url":"https:///video"}`, 400},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			source := "t17-http-" + uuid.NewString()
-			t.Cleanup(func() {
-				cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				if _, err := pool.Exec(cleanup, `DELETE FROM sm_inputs WHERE source=$1`, source); err != nil {
-					t.Error(err)
-				}
-			})
-			response := performRequest(server, http.MethodPost, "/api/v1/inputs",
-				fmt.Sprintf(`{"source":%q,"payload":%s}`, source, tc.payload))
-			if response.Code != tc.want {
-				t.Errorf("status = %d, want %d: %s", response.Code, tc.want, response.Body)
-			}
-			if tc.want == 201 {
-				var created createInputResponse
-				if err := json.Unmarshal(response.Body.Bytes(), &created); err != nil ||
-					created.InputID == uuid.Nil || created.ProcessID == uuid.Nil || created.ID != created.InputID || created.Status != "new" {
-					t.Fatalf("invalid successful response: %s (%v)", response.Body, err)
-				}
-			} else {
-				if response.Body.String() != "{\"error\":\"invalid payload\"}\n" {
-					t.Errorf("unexpected rejection response: %s", response.Body)
-				}
-				var count int
-				if err := pool.QueryRow(ctx, `SELECT count(*) FROM sm_inputs WHERE source=$1`, source).Scan(&count); err != nil || count != 0 {
-					t.Errorf("input count after failure = %d, %v", count, err)
-				}
-			}
-		})
 	}
 }
 
@@ -587,11 +344,24 @@ func TestCreateActionIntegration(t *testing.T) {
 			t.Error(err)
 		}
 	}
-	defer cleanupSQL(`DELETE FROM sm_inputs WHERE source=$1 OR (source='api' AND payload->>'test_marker'=$1)`, marker)
+	defer cleanupSQL(`DELETE FROM sm_inputs WHERE source='api' AND payload->>'test_marker'=$1`, marker)
 
-	checkCreated := func(path, body, source, payload string) {
+	counts := func(t *testing.T) (result [3]int) {
 		t.Helper()
-		response := performRequest(server, "POST", path, body)
+		if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM sm_inputs),
+			(SELECT count(*) FROM sm_processes), (SELECT count(*) FROM sm_jobs)`).
+			Scan(&result[0], &result[1], &result[2]); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	actionBody := func(action string, version int, data string) string {
+		return fmt.Sprintf(`{"action":%q,"version":%d,"data":%s}`, action, version, data)
+	}
+	checkCreated := func(t *testing.T, action, data, payload string) {
+		t.Helper()
+		before := counts(t)
+		response := performRequest(server, http.MethodPost, "/api/v1/actions", actionBody(action, 1, data))
 		var result createInputResponse
 		if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil ||
 			result.InputID == uuid.Nil || result.ProcessID == uuid.Nil {
@@ -603,37 +373,49 @@ func TestCreateActionIntegration(t *testing.T) {
 		})
 		var matches int
 		err := pool.QueryRow(ctx, `SELECT count(*) FROM sm_inputs i JOIN sm_processes p ON p.input_id=i.id
-			JOIN sm_jobs j ON j.process_id=p.id WHERE i.id=$1 AND p.id=$2 AND i.source=$3
-			AND i.payload=$4::jsonb AND j.payload=i.payload AND j.tool_name='echo-test'
-			AND j.action_version=1 AND j.status='pending'`, result.InputID, result.ProcessID, source, payload).Scan(&matches)
+			JOIN sm_jobs j ON j.process_id=p.id WHERE i.id=$1 AND p.id=$2 AND i.source='api'
+			AND i.payload=$3::jsonb AND j.payload=i.payload AND j.tool_name=$4
+			AND j.action_version=1 AND j.status='pending'`, result.InputID, result.ProcessID, payload, action).Scan(&matches)
 		if err != nil || matches != 1 {
 			t.Fatalf("matching queued chains=%d error=%v", matches, err)
 		}
+		want := [3]int{before[0] + 1, before[1] + 1, before[2] + 1}
+		if after := counts(t); after != want {
+			t.Fatalf("successful HTTP request changed counts %v → %v, want %v", before, after, want)
+		}
 	}
 	data := fmt.Sprintf(`{"message":"\u0068ello","test_marker":%q,"extra":9007199254740993}`, marker)
-	actionBody := func(version int, data string) string {
-		return fmt.Sprintf(`{"action":"echo-test","version":%d,"data":%s}`, version, data)
+	for _, tc := range []struct {
+		name, action, data, payload string
+	}{
+		{"exact data", "echo-test", data,
+			fmt.Sprintf(`{"tool":"echo-test","message":"hello","test_marker":%q,"extra":9007199254740993}`, marker)},
+		{"default echo", "echo-test", fmt.Sprintf(`{"test_marker":%q}`, marker),
+			fmt.Sprintf(`{"tool":"echo-test","test_marker":%q}`, marker)},
+		{"web URL", "yt-dlp", fmt.Sprintf(`{"url":"https://example.org/video","test_marker":%q}`, marker),
+			fmt.Sprintf(`{"tool":"yt-dlp","url":"https://example.org/video","test_marker":%q}`, marker)},
+		{"default pattern", "fabric", fmt.Sprintf(`{"text":"body","test_marker":%q}`, marker),
+			fmt.Sprintf(`{"tool":"fabric","text":"body","test_marker":%q}`, marker)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			checkCreated(t, tc.action, tc.data, tc.payload)
+		})
 	}
-	checkCreated("/api/v1/actions", actionBody(1, data), "api",
-		fmt.Sprintf(`{"tool":"echo-test","message":"hello","test_marker":%q,"extra":9007199254740993}`, marker))
-	checkCreated("/api/v1/inputs", fmt.Sprintf(`{"source":%q,"payload":{"tool":"echo-test"}}`, marker),
-		marker, `{"tool":"echo-test"}`)
 
-	counts := func(t *testing.T) (result [3]int) {
-		t.Helper()
-		if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM sm_inputs),
-			(SELECT count(*) FROM sm_processes), (SELECT count(*) FROM sm_jobs)`).
-			Scan(&result[0], &result[1], &result[2]); err != nil {
-			t.Fatal(err)
-		}
-		return result
-	}
 	for _, tc := range []struct {
 		name, body, setup string
 	}{
-		{"disabled v1", actionBody(1, data), `UPDATE sm_actions SET enabled=false WHERE action='echo-test' AND version=1 AND enabled`},
-		{"active v2", actionBody(2, data), `INSERT INTO sm_actions VALUES ('echo-test',2,'Echo v2',true)`},
-		{"JSON null", actionBody(1, `null`), ""},
+		{"disabled v1", actionBody("echo-test", 1, data), `UPDATE sm_actions SET enabled=false WHERE action='echo-test' AND version=1 AND enabled`},
+		{"active v2", actionBody("echo-test", 2, data), `INSERT INTO sm_actions VALUES ('echo-test',2,'Echo v2',true)`},
+		{"JSON null", actionBody("echo-test", 1, `null`), ""},
+		{"string data", actionBody("echo-test", 1, `"echo-test"`), ""},
+		{"client-supplied tool", actionBody("echo-test", 1, `{"tool":"echo-test"}`), ""},
+		{"unknown action", actionBody("unsupported", 1, `{}`), ""},
+		{"padded action", actionBody(" echo-test ", 1, `{}`), ""},
+		{"null message", actionBody("echo-test", 1, `{"message":null}`), ""},
+		{"missing text", actionBody("fabric", 1, `{}`), ""},
+		{"invalid pattern", actionBody("fabric", 1, `{"text":"body","pattern":"../x"}`), ""},
+		{"invalid URL", actionBody("yt-dlp", 1, `{"url":"https:///video"}`), ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fixtureServer := server
@@ -880,7 +662,7 @@ func readFixture() (db.ProcessDetails, map[string]any, []map[string]any) {
 
 func requireReadOnly(t *testing.T, f *fakeDatabase) {
 	t.Helper()
-	if f.createInputCalls != 0 || f.updateCalls != 0 || f.pingCalls != 0 {
+	if f.createActionCalls != 0 || f.updateCalls != 0 || f.pingCalls != 0 {
 		t.Fatal("read endpoint called unrelated database method")
 	}
 }
@@ -1082,7 +864,7 @@ func TestRouting(t *testing.T) {
 		target string
 		want   int
 	}{
-		{http.MethodGet, "/api/v1/inputs", http.StatusMethodNotAllowed},
+		{http.MethodPut, "/api/v1/actions", http.StatusMethodNotAllowed},
 		{http.MethodPost, "/healthz", http.StatusMethodNotAllowed},
 		{http.MethodPost, "/api/v1/processes/" + uuid.NewString(), http.StatusMethodNotAllowed},
 		{http.MethodPost, "/api/v1/jobs", http.StatusMethodNotAllowed},
@@ -1214,22 +996,23 @@ func TestListActionsDisablePreservesJob(t *testing.T) {
 	defer cancel()
 	server, verification := newActionsIntegrationServer(ctx, t)
 
-	source := "t23-" + uuid.NewString()
+	marker := "t23-" + uuid.NewString()
 	var createdInput bool
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		tag, err := verification.Exec(ctx, "DELETE FROM public.sm_inputs WHERE source = $1", source)
+		tag, err := verification.Exec(ctx, `DELETE FROM public.sm_inputs
+			WHERE source='api' AND payload->>'test_marker'=$1`, marker)
 		if err != nil {
 			t.Errorf("clean catalog test input: %v", err)
 		} else if createdInput && tag.RowsAffected() != 1 {
 			t.Errorf("deleted %d inputs, want 1", tag.RowsAffected())
 		}
 	})
-	body := fmt.Sprintf(`{"source":%q,"payload":{"tool":"word-count","text":"keep history"}}`, source)
-	response := performRequest(server, http.MethodPost, "/api/v1/inputs", body)
+	body := fmt.Sprintf(`{"action":"word-count","version":1,"data":{"text":"keep history","test_marker":%q}}`, marker)
+	response := performRequest(server, http.MethodPost, "/api/v1/actions", body)
 	if response.Code != http.StatusCreated {
-		t.Fatalf("POST input status = %d, want 201; body: %s", response.Code, response.Body)
+		t.Fatalf("POST action status = %d, want 201; body: %s", response.Code, response.Body)
 	}
 	createdInput = true
 	var created struct {
@@ -1357,7 +1140,7 @@ func createJobResultFixture(ctx context.Context, t *testing.T, verification *pgx
 	t.Helper()
 	var inputID uuid.UUID
 	if err := verification.QueryRow(ctx, `SELECT input_id, process_id
-		FROM public.sm_create_input('t26-test', '{"tool":"echo-test"}'::jsonb)`).Scan(&inputID, &processID); err != nil {
+		FROM public.sm_create_action('echo-test', 1, '{}'::jsonb)`).Scan(&inputID, &processID); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -1452,7 +1235,7 @@ func TestServerIntegration(t *testing.T) {
 		t.Fatalf("create verification pool: %v", err)
 	}
 
-	source := "step5-test-" + uuid.NewString()
+	marker := "step5-test-" + uuid.NewString()
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(
 			context.Background(),
@@ -1461,8 +1244,8 @@ func TestServerIntegration(t *testing.T) {
 		defer cleanupCancel()
 		if _, err := verification.Exec(
 			cleanupCtx,
-			"DELETE FROM sm_inputs WHERE source = $1",
-			source,
+			`DELETE FROM sm_inputs WHERE source='api' AND payload->>'test_marker'=$1`,
+			marker,
 		); err != nil {
 			t.Errorf("clean integration input: %v", err)
 		}
@@ -1473,16 +1256,8 @@ func TestServerIntegration(t *testing.T) {
 	httpServer := httptest.NewServer(NewServer(database, t.TempDir(), apiTestLogger()).Handler())
 	t.Cleanup(httpServer.Close)
 
-	requestBody, err := json.Marshal(createInputRequest{
-		Source: source,
-		Payload: json.RawMessage(
-			`{"tool":"echo-test","message":"integration"}`,
-		),
-	})
-	if err != nil {
-		t.Fatalf("marshal integration input: %v", err)
-	}
-	response, err := postJSON(ctx, httpServer.Client(), httpServer.URL+"/api/v1/inputs", requestBody)
+	requestBody := fmt.Appendf(nil, `{"action":"echo-test","version":1,"data":{"message":"integration","test_marker":%q}}`, marker)
+	response, err := postJSON(ctx, httpServer.Client(), httpServer.URL+"/api/v1/actions", requestBody)
 	if err != nil {
 		t.Fatalf("post integration input: %v", err)
 	}
@@ -1592,7 +1367,7 @@ func TestServerIntegration(t *testing.T) {
 		pendingJob.ToolName != "echo-test" || pendingJob.Status != db.StatusPending ||
 		pendingJob.Priority != 0 || pendingJob.ResultPath != nil || pendingJob.ErrorMsg != nil ||
 		pendingJob.CreatedAt.IsZero() || pendingJob.UpdatedAt.IsZero() ||
-		!reflect.DeepEqual(pendingPayload, map[string]any{"tool": "echo-test", "message": "integration"}) {
+		!reflect.DeepEqual(pendingPayload, map[string]any{"tool": "echo-test", "message": "integration", "test_marker": marker}) {
 		t.Fatalf("pending job = %+v, payload = %s", pendingJob, pendingJob.Payload)
 	}
 	var pendingJobs []integrationJob

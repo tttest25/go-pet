@@ -13,7 +13,6 @@ import (
 
 const (
 	listenJobsQuery   = "LISTEN sm_jobs_channel"
-	createInputQuery  = `SELECT * FROM sm_create_input($1, $2)`
 	createActionQuery = `SELECT input_id, process_id, status FROM public.sm_create_action($1, $2, $3)`
 	pickNextJobQuery  = `SELECT id, process_id, tool_name, payload, old_status, status, action_version
 		FROM public.sm_pick_next_job_with_version()`
@@ -170,21 +169,6 @@ type CreatedInput struct {
 	Status    string
 }
 
-func (d *DB) CreateInput(ctx context.Context, source string, payload json.RawMessage) (CreatedInput, error) {
-	var created CreatedInput
-	err := d.pool.QueryRow(ctx, createInputQuery, source, payload).Scan(
-		&created.InputID, &created.ProcessID, &created.Status,
-	)
-	if err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "22023" {
-			return CreatedInput{}, fmt.Errorf("create input from source %q: %w: %w", source, ErrInvalidInput, err)
-		}
-		return CreatedInput{}, fmt.Errorf("create input from source %q: %w", source, mapQueueError(err))
-	}
-	return created, nil
-}
-
 func (d *DB) CreateAction(ctx context.Context, action string, version int32, data json.RawMessage) (CreatedInput, error) {
 	return createAction(ctx, d.pool.QueryRow, action, version, data)
 }
@@ -210,7 +194,7 @@ func createAction(
 		if errors.As(err, &pgErr) && pgErr.Code == "22023" {
 			return CreatedInput{}, fmt.Errorf("create action: %w: %w", ErrInvalidInput, err)
 		}
-		return CreatedInput{}, fmt.Errorf("create action: %w", err)
+		return CreatedInput{}, fmt.Errorf("create action: %w", mapQueueError(err))
 	}
 	return created, nil
 }

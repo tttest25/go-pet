@@ -26,8 +26,8 @@ import (
 )
 
 const testLockPath = "/opt/go-pet/postgres/.petar-test-db.lock"
-const testReadyMarker = "petar:test-db:lifecycle=v1;state=ready"
-const testPreparingMarker = "petar:test-db:lifecycle=v1;state=preparing"
+const testReadyMarker = "petar:test-db:lifecycle=v2;state=ready"
+const testPreparingMarker = "petar:test-db:lifecycle=v2;state=preparing"
 
 // Driver errors may contain connection strings. Preserve their causal chain for
 // errors.Is/As without exposing credentials through Error or ordinary %w logs.
@@ -393,7 +393,7 @@ func checkTestSchema(ctx context.Context, conn *pgx.Conn) error {
 	AND EXISTS (SELECT FROM pg_constraint WHERE conrelid=to_regclass('public.sm_jobs')
 	  AND conname='sm_jobs_tool_name_check' AND contype='c' AND convalidated
 	  AND strpos(pg_get_constraintdef(oid), $$'word-count'$$)>0)
-	AND to_regprocedure('public.sm_create_input(text,jsonb)') IS NOT NULL
+	AND to_regprocedure('public.sm_create_input(text,jsonb)') IS NULL
 	AND to_regprocedure('public.sm_create_action(text,integer,jsonb)') IS NOT NULL
 	AND EXISTS (SELECT FROM information_schema.columns
 	  WHERE table_schema='public' AND table_name='sm_jobs' AND column_name='action_version'
@@ -410,7 +410,7 @@ func checkTestSchema(ctx context.Context, conn *pgx.Conn) error {
 		return testDatabaseError("query required schema objects", err)
 	}
 	if !valid {
-		return errors.New("test database: required tables, columns, functions, extensions, triggers or 000007 word-count baseline missing")
+		return errors.New("test database: required 000008 schema objects missing or legacy input still present")
 	}
 	return nil
 }

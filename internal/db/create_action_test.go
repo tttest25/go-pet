@@ -42,6 +42,7 @@ func testActionEnqueue(t *testing.T, env *queueTestEnv) {
 		{"yt-dlp", "yt-dlp", `{"url":"https://example.org/video"}`, `{"tool":"yt-dlp","url":"https://example.org/video"}`},
 		{"fabric", "fabric", `{"text":" body ","extra":{"n":9007199254740993}}`, `{"tool":"fabric","text":" body ","extra":{"n":9007199254740993}}`},
 		{"word-count", "word-count", `{"text":"один два три"}`, `{"tool":"word-count","text":"один два три"}`},
+		{"word-count preserved", "word-count", `{"text":"  padded text  ","extra":true}`, `{"tool":"word-count","text":"  padded text  ","extra":true}`},
 		{"word-count empty", "word-count", `{"text":""}`, `{"tool":"word-count","text":""}`},
 		{"word-count separators", "word-count", `{"text":" \n\t\u00a0\u2003","extra":{"n":9007199254740993}}`, `{"tool":"word-count","text":" \n\t\u00a0\u2003","extra":{"n":9007199254740993}}`},
 	} {
@@ -134,30 +135,6 @@ func testActionEnqueue(t *testing.T, env *queueTestEnv) {
 			}
 		})
 	}
-	t.Run("word-count legacy", func(t *testing.T) {
-		const payload = `{"tool":"word-count","text":"  legacy text  ","extra":true}`
-		before := counts(t)
-		var inputID, processID uuid.UUID
-		var status string
-		err := tx.QueryRow(ctx, `SELECT * FROM public.sm_create_input($1,$2)`, env.source, payload).
-			Scan(&inputID, &processID, &status)
-		if err != nil || status != "new" {
-			t.Fatalf("legacy create: status=%q error=%v", status, err)
-		}
-		var match bool
-		err = tx.QueryRow(ctx, `SELECT EXISTS (
-			SELECT FROM sm_inputs i JOIN sm_processes p ON p.input_id=i.id
-			JOIN sm_jobs j ON j.process_id=p.id
-			WHERE i.id=$1 AND p.id=$2 AND i.source=$3 AND i.payload=$4::jsonb
-			  AND j.payload=i.payload AND j.tool_name='word-count' AND j.action_version=1 AND j.status='pending')`,
-			inputID, processID, env.source, payload).Scan(&match)
-		if err != nil || !match {
-			t.Fatalf("legacy chain matches=%t error=%v", match, err)
-		}
-		if got := counts(t); got != [3]int{before[0] + 1, before[1] + 1, before[2] + 1} {
-			t.Fatalf("expected exactly one new legacy chain: %v → %v", before, got)
-		}
-	})
 }
 
 func testActionVersionColumn(t *testing.T, env *queueTestEnv) {
@@ -170,16 +147,13 @@ func testActionVersionColumn(t *testing.T, env *queueTestEnv) {
 	if err != nil || dataType != "integer" || nullable != "NO" || defaultValue != "1" {
 		t.Fatalf("action_version type=%q nullable=%q default=%q error=%v", dataType, nullable, defaultValue, err)
 	}
-	created, err := env.database.CreateInput(ctx, env.source, []byte(`{"tool":"echo-test"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
+	ids := env.createJob(t, ctx, []byte(`{"tool":"echo-test"}`))
 	var version int
-	if err := env.pool.QueryRow(ctx, `SELECT action_version FROM sm_jobs WHERE process_id=$1`, created.ProcessID).
+	if err := env.pool.QueryRow(ctx, `SELECT action_version FROM sm_jobs WHERE id=$1`, ids.jobID).
 		Scan(&version); err != nil || version != 1 {
-		t.Fatalf("legacy action_version=%d error=%v", version, err)
+		t.Fatalf("default action_version=%d error=%v", version, err)
 	}
-	_, err = env.pool.Exec(ctx, `UPDATE sm_jobs SET action_version=0 WHERE process_id=$1`, created.ProcessID)
+	_, err = env.pool.Exec(ctx, `UPDATE sm_jobs SET action_version=0 WHERE id=$1`, ids.jobID)
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != "23514" || pgErr.ConstraintName != "sm_jobs_action_version_positive" {
 		t.Fatalf("zero version error=%v, want positivity check violation", err)
@@ -200,12 +174,12 @@ func testActionDispatchVersion(t *testing.T, env *queueTestEnv) {
 	var picked bool
 	err = tx.QueryRow(ctx, `
 		WITH created AS MATERIALIZED (
-			SELECT * FROM public.sm_create_input($1,'{"tool":"echo-test"}')
+			SELECT * FROM public.sm_create_action('echo-test', 1, '{}'::jsonb)
 		)
 		SELECT (
 			SELECT j.process_id=created.process_id AND j.action_version=1 AND j.status='dispatched'
 			FROM public.sm_pick_next_job_with_version() AS j
-		) FROM created`, env.source).Scan(&picked)
+		) FROM created`).Scan(&picked)
 	if err != nil || !picked {
 		t.Fatalf("pick newly visible job: correct job/version/status=%t error=%v", picked, err)
 	}

@@ -3,6 +3,7 @@ package spool
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -121,15 +122,16 @@ func newRecoveryFixture(t *testing.T) (context.Context, *recoveryFixture) {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	source := "t21-recovery-" + uuid.NewString()
+	marker := "t21-recovery-" + uuid.NewString()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		if _, err := pool.Exec(ctx, `DELETE FROM sm_inputs WHERE source=$1`, source); err != nil {
+		if _, err := pool.Exec(ctx, `DELETE FROM sm_inputs WHERE source='api' AND payload->>'_test_fixture'=$1`, marker); err != nil {
 			t.Errorf("cleanup recovery input: %v", err)
 		}
 	})
-	created, err := database.CreateInput(ctx, source, json.RawMessage(`{"tool":"echo-test","message":"T21 recovery"}`))
+	data := json.RawMessage(fmt.Sprintf(`{"message":"T21 recovery","_test_fixture":%q}`, marker))
+	created, err := database.CreateAction(ctx, "echo-test", 1, data)
 	if err != nil {
 		t.Fatal(err)
 	}

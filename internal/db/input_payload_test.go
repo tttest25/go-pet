@@ -1,10 +1,12 @@
 package db_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -12,7 +14,7 @@ import (
 	"petar/internal/db"
 )
 
-func TestCreateInputPayloadContract(t *testing.T) {
+func TestCreateActionPayloadContract(t *testing.T) {
 	env := newQueueTestEnv(t, "t17-db-"+uuid.NewString())
 	ctx := queueTestContext(t)
 	counts := func(t *testing.T) (result [3]int) {
@@ -26,83 +28,86 @@ func TestCreateInputPayloadContract(t *testing.T) {
 		return result
 	}
 	tests := []struct {
-		name, payload, tool string // empty tool means rejection
+		name, action, data string
+		valid              bool
 	}{
-		{"SQL null", "", ""},
-		{"JSON null", `null`, ""},
-		{"array", `[]`, ""},
-		{"scalar", `"echo-test"`, ""},
-		{"missing tool", `{}`, ""},
-		{"null tool", `{"tool":null}`, ""},
-		{"number tool", `{"tool":123}`, ""},
-		{"unknown tool", `{"tool":"unknown"}`, ""},
-		{"wrong case", `{"tool":"Echo-test"}`, ""},
-		{"padded tool", `{"tool":" echo-test "}`, ""},
-		{"default echo", `{"tool":"echo-test"}`, "echo-test"},
-		{"preserved echo", `{"tool":"echo-test","message":"  привет  ","extra":1}`, "echo-test"},
-		{"null message", `{"tool":"echo-test","message":null}`, ""},
-		{"boolean message", `{"tool":"echo-test","message":false}`, ""},
-		{"numeric message", `{"tool":"echo-test","message":8}`, ""},
-		{"object message", `{"tool":"echo-test","message":{}}`, ""},
-		{"empty message", `{"tool":"echo-test","message":""}`, ""},
-		{"blank message", `{"tool":"echo-test","message":" \t\r\n"}`, ""},
-		{"missing text", `{"tool":"fabric"}`, ""},
-		{"null text", `{"tool":"fabric","text":null}`, ""},
-		{"number text", `{"tool":"fabric","text":7}`, ""},
-		{"empty text", `{"tool":"fabric","text":""}`, ""},
-		{"blank text", `{"tool":"fabric","text":"\t\n "}`, ""},
-		{"default pattern", `{"tool":"fabric","text":"  a\nb  "}`, "fabric"},
-		{"named pattern", `{"tool":"fabric","text":"x","pattern":"A_b-2"}`, "fabric"},
-		{"null pattern", `{"tool":"fabric","text":"x","pattern":null}`, ""},
-		{"numeric pattern", `{"tool":"fabric","text":"x","pattern":8}`, ""},
-		{"empty pattern", `{"tool":"fabric","text":"x","pattern":""}`, ""},
-		{"non-ASCII pattern", `{"tool":"fabric","text":"x","pattern":"é"}`, ""},
-		{"path pattern", `{"tool":"fabric","text":"x","pattern":"a/b.md"}`, ""},
-		{"newline pattern", `{"tool":"fabric","text":"x","pattern":"a\n"}`, ""},
-		{"whitespace pattern", `{"tool":"fabric","text":"x","pattern":" a "}`, ""},
-		{"web URL", `{"tool":"yt-dlp","url":"HTTPS://example.org/a?q=1#t"}`, "yt-dlp"},
-		{"local host", `{"tool":"yt-dlp","url":"http://localhost:8080/x"}`, "yt-dlp"},
-		{"IPv4 host", `{"tool":"yt-dlp","url":"http://127.0.0.1/x"}`, "yt-dlp"},
-		{"IPv6 host", `{"tool":"yt-dlp","url":"http://[::1]:8080/"}`, "yt-dlp"},
-		{"missing URL", `{"tool":"yt-dlp"}`, ""},
-		{"null URL", `{"tool":"yt-dlp","url":null}`, ""},
-		{"numeric URL", `{"tool":"yt-dlp","url":7}`, ""},
-		{"relative URL", `{"tool":"yt-dlp","url":"/path"}`, ""},
-		{"scheme-relative URL", `{"tool":"yt-dlp","url":"//host/a"}`, ""},
-		{"FTP URL", `{"tool":"yt-dlp","url":"ftp://host/a"}`, ""},
-		{"empty URL host", `{"tool":"yt-dlp","url":"https:///a"}`, ""},
-		{"query as host", `{"tool":"yt-dlp","url":"https://?q"}`, ""},
-		{"port as host", `{"tool":"yt-dlp","url":"https://:443/a"}`, ""},
-		{"userinfo as host", `{"tool":"yt-dlp","url":"https://user@/a"}`, ""},
-		{"unclosed IPv6", `{"tool":"yt-dlp","url":"http://[::1/a"}`, ""},
-		{"raw whitespace", `{"tool":"yt-dlp","url":"https://host/a b"}`, ""},
-		{"raw control", `{"tool":"yt-dlp","url":"https://host/a\tb"}`, ""},
-	}
-	for _, length := range []int{128, 129} {
-		name, tool := "128-byte pattern", "fabric"
-		if length == 129 {
-			name, tool = "129-byte pattern", ""
-		}
-		tests = append(tests, struct{ name, payload, tool string }{
-			name, `{"tool":"fabric","text":"x","pattern":"` + strings.Repeat("a", length) + `"}`, tool,
-		})
+		{"SQL null", "echo-test", "", false},
+		{"JSON null", "echo-test", `null`, false},
+		{"array", "echo-test", `[]`, false},
+		{"scalar", "echo-test", `"echo-test"`, false},
+		{"empty action", "", `{}`, false},
+		{"null tool collision", "echo-test", `{"tool":null}`, false},
+		{"number tool collision", "echo-test", `{"tool":123}`, false},
+		{"unknown action", "unknown", `{}`, false},
+		{"wrong case", "Echo-test", `{}`, false},
+		{"padded action", " echo-test ", `{}`, false},
+		{"default echo", "echo-test", `{}`, true},
+		{"preserved echo", "echo-test", `{"message":"  привет  ","extra":9007199254740993}`, true},
+		{"null message", "echo-test", `{"message":null}`, false},
+		{"boolean message", "echo-test", `{"message":false}`, false},
+		{"numeric message", "echo-test", `{"message":8}`, false},
+		{"object message", "echo-test", `{"message":{}}`, false},
+		{"empty message", "echo-test", `{"message":""}`, false},
+		{"blank message", "echo-test", `{"message":" \t\r\n"}`, false},
+		{"missing text", "fabric", `{}`, false},
+		{"null text", "fabric", `{"text":null}`, false},
+		{"number text", "fabric", `{"text":7}`, false},
+		{"empty text", "fabric", `{"text":""}`, false},
+		{"blank text", "fabric", `{"text":"\t\n "}`, false},
+		{"default pattern", "fabric", `{"text":"  a\nb  "}`, true},
+		{"named pattern", "fabric", `{"text":"x","pattern":"A_b-2"}`, true},
+		{"null pattern", "fabric", `{"text":"x","pattern":null}`, false},
+		{"numeric pattern", "fabric", `{"text":"x","pattern":8}`, false},
+		{"empty pattern", "fabric", `{"text":"x","pattern":""}`, false},
+		{"non-ASCII pattern", "fabric", `{"text":"x","pattern":"é"}`, false},
+		{"path pattern", "fabric", `{"text":"x","pattern":"a/b.md"}`, false},
+		{"newline pattern", "fabric", `{"text":"x","pattern":"a\n"}`, false},
+		{"whitespace pattern", "fabric", `{"text":"x","pattern":" a "}`, false},
+		{"128-byte pattern", "fabric", `{"text":"x","pattern":"` + strings.Repeat("a", 128) + `"}`, true},
+		{"129-byte pattern", "fabric", `{"text":"x","pattern":"` + strings.Repeat("a", 129) + `"}`, false},
+		{"web URL", "yt-dlp", `{"url":"HTTPS://example.org/a?q=1#t"}`, true},
+		{"local host", "yt-dlp", `{"url":"http://localhost:8080/x"}`, true},
+		{"IPv4 host", "yt-dlp", `{"url":"http://127.0.0.1/x"}`, true},
+		{"IPv6 host", "yt-dlp", `{"url":"http://[::1]:8080/"}`, true},
+		{"missing URL", "yt-dlp", `{}`, false},
+		{"null URL", "yt-dlp", `{"url":null}`, false},
+		{"numeric URL", "yt-dlp", `{"url":7}`, false},
+		{"relative URL", "yt-dlp", `{"url":"/path"}`, false},
+		{"scheme-relative URL", "yt-dlp", `{"url":"//host/a"}`, false},
+		{"FTP URL", "yt-dlp", `{"url":"ftp://host/a"}`, false},
+		{"empty URL host", "yt-dlp", `{"url":"https:///a"}`, false},
+		{"query as host", "yt-dlp", `{"url":"https://?q"}`, false},
+		{"port as host", "yt-dlp", `{"url":"https://:443/a"}`, false},
+		{"userinfo as host", "yt-dlp", `{"url":"https://user@/a"}`, false},
+		{"unclosed IPv6", "yt-dlp", `{"url":"http://[::1/a"}`, false},
+		{"raw whitespace", "yt-dlp", `{"url":"https://host/a b"}`, false},
+		{"raw control", "yt-dlp", `{"url":"https://host/a\tb"}`, false},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			before := counts(t)
-			payload := json.RawMessage(tc.payload)
-			if tc.payload == "" {
-				payload = nil
+			var data json.RawMessage
+			if tc.data != "" {
+				data = json.RawMessage(tc.data)
 			}
-			created, err := env.database.CreateInput(ctx, env.source, payload)
-			if tc.tool == "" {
+			created, err := env.database.CreateAction(ctx, tc.action, 1, data)
+			if created.InputID != uuid.Nil {
+				t.Cleanup(func() {
+					cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					if _, err := env.pool.Exec(cleanupCtx, `DELETE FROM sm_inputs WHERE id=$1`, created.InputID); err != nil {
+						t.Errorf("clean up action input %s: %v", created.InputID, err)
+					}
+				})
+			}
+			if !tc.valid {
 				var pgErr *pgconn.PgError
 				if !errors.As(err, &pgErr) || pgErr.Code != "22023" {
-					t.Errorf("CreateInput error = %v, want SQLSTATE 22023", err)
+					t.Errorf("CreateAction error = %v, want SQLSTATE 22023", err)
 				}
 				if !errors.Is(err, db.ErrInvalidInput) || errors.Is(err, db.ErrInvalidCallbackStatus) {
-					t.Errorf("CreateInput error = %v, want only the input sentinel", err)
+					t.Errorf("CreateAction error = %v, want only the input sentinel", err)
 				}
 				if got := counts(t); got != before {
 					t.Errorf("input/process/job counts changed after rejection: %v → %v", before, got)
@@ -110,13 +115,15 @@ func TestCreateInputPayloadContract(t *testing.T) {
 				return
 			}
 			if err != nil || created.InputID == uuid.Nil || created.ProcessID == uuid.Nil || created.Status != "new" {
-				t.Fatalf("CreateInput = %+v, %v", created, err)
+				t.Fatalf("CreateAction = %+v, %v", created, err)
 			}
 			var matching int
 			err = env.pool.QueryRow(ctx, `SELECT count(*) FROM sm_inputs i
 				JOIN sm_processes p ON p.input_id = i.id JOIN sm_jobs j ON j.process_id = p.id
-				WHERE i.id=$1 AND p.id=$2 AND i.payload=$3::jsonb AND j.payload=i.payload
-					AND j.tool_name=$4 AND j.status='pending'`, created.InputID, created.ProcessID, payload, tc.tool).Scan(&matching)
+				WHERE i.id=$1 AND p.id=$2 AND i.source='api'
+					AND i.payload=($3::jsonb || jsonb_build_object('tool', $4::text))
+					AND j.payload=i.payload AND j.tool_name=$4 AND j.status='pending'
+					AND j.action_version=1`, created.InputID, created.ProcessID, data, tc.action).Scan(&matching)
 			if err != nil || matching != 1 {
 				t.Fatalf("matching chains = %d, %v; want one with unchanged payload", matching, err)
 			}

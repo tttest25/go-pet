@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 var _ func(context.Context, *testing.T) string = requireTestDSN
@@ -54,7 +56,7 @@ func TestTestDSNContract(t *testing.T) {
 	}
 }
 
-var guardIntegrationTests = []string{"TestPing", "TestCreateInputReturnsCreatedProcess"}
+var guardIntegrationTests = []string{"TestPing", "TestCreateActionReturnsCreatedProcess"}
 
 func TestTestDSNRejectsEnvironmentOverrides(t *testing.T) {
 	t.Setenv("PETAR_TEST_DB_DSN", "postgres://petar_user:private-secret@127.0.0.1:5432/petar_test?sslmode=disable")
@@ -149,6 +151,53 @@ func TestGuardSourcesStayIdentical(t *testing.T) {
 		if readBody(path) != want {
 			t.Fatalf("%s differs from canonical db test guard", path)
 		}
+	}
+}
+
+func TestSchemaGuardRejectsLegacyBaseline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cfg, err := testConnectionConfig(ctx, requireTestDSN(ctx, t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(context.Background())
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	apply := func(ctx context.Context, direction string) {
+		t.Helper()
+		path := "../../postgres/migrations/000008_retire_legacy_input." + direction + ".sql"
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, string(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := checkTestSchema(ctx, conn); err != nil {
+		t.Fatalf("ready T28 schema refused: %v", err)
+	}
+	apply(ctx, "down")
+	if err := checkTestSchema(ctx, conn); err == nil || !strings.Contains(err.Error(), "000008") {
+		t.Fatalf("schema guard must refuse ready-marker database at the legacy baseline: %v", err)
+	}
+	apply(ctx, "up")
+	if err := checkTestSchema(ctx, conn); err != nil {
+		t.Fatalf("restored new schema refused: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `DROP FUNCTION public.sm_create_action(text,integer,jsonb)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkTestSchema(ctx, conn); err == nil || !strings.Contains(err.Error(), "000008") {
+		t.Fatalf("schema guard must require the new function: %v", err)
 	}
 }
 

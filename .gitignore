@@ -1,5 +1,7 @@
 # Данные PostgreSQL (хранятся локально, в репозиторий не идут)
 postgres/data/
+postgres/.t28-migration.*/
+postgres/.t28-cutover.*/
 
 # Файловые буферы очереди задач (/spool)
 spool/in/*

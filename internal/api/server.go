@@ -31,12 +31,6 @@ type databaseAPI interface {
 	ListActions(ctx context.Context) ([]db.ActionVersion, error)
 	CreateAction(ctx context.Context, action string, version int32, data json.RawMessage) (db.CreatedInput, error)
 
-	CreateInput(
-		ctx context.Context,
-		source string,
-		payload json.RawMessage,
-	) (db.CreatedInput, error)
-
 	UpdateJobStatus(
 		ctx context.Context,
 		jobID uuid.UUID,
@@ -52,11 +46,6 @@ type Server struct {
 	handler         http.Handler
 	logger          *slog.Logger
 	spoolDir        string
-}
-
-type createInputRequest struct {
-	Source  string          `json:"source"`
-	Payload json.RawMessage `json:"payload"`
 }
 
 type createActionRequest struct {
@@ -163,7 +152,6 @@ func newServer(database databaseAPI, logger *slog.Logger) *Server {
 	mux.HandleFunc("GET /api/v1/jobs/{id}/result", server.handleGetJobResult)
 	mux.HandleFunc("GET /api/v1/actions", server.handleListActions)
 	mux.HandleFunc("POST /api/v1/actions", server.handleCreateAction)
-	mux.HandleFunc("POST /api/v1/inputs", server.handleCreateInput)
 	mux.HandleFunc(
 		"POST /api/v1/jobs/{id}/status",
 		server.handleUpdateJobStatus,
@@ -344,51 +332,6 @@ func (s *Server) handleCreateAction(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusInternalServerError, "failed to create action")
 		return
 	}
-	s.writeCreatedInput(w, created)
-}
-
-func (s *Server) handleCreateInput(w http.ResponseWriter, r *http.Request) {
-	var request createInputRequest
-	if err := decodeJSON(w, r, &request); err != nil {
-		s.writeError(w, http.StatusBadRequest, "invalid JSON request body")
-		return
-	}
-
-	source := strings.TrimSpace(request.Source)
-	if source == "" {
-		s.writeError(w, http.StatusBadRequest, "source is required")
-		return
-	}
-	if len(request.Payload) == 0 || request.Payload[0] != '{' {
-		s.writeError(w, http.StatusBadRequest, "payload must be a JSON object")
-		return
-	}
-
-	ctx, cancel := context.WithTimeoutCause(r.Context(), s.databaseTimeout, errDatabaseDeadline)
-	defer cancel()
-	created, err := s.database.CreateInput(ctx, source, request.Payload)
-	if err != nil {
-		if s.writeDatabaseTimeout(ctx, w) {
-			return
-		}
-		if errors.Is(err, db.ErrInvalidInput) {
-			s.writeError(w, http.StatusBadRequest, "invalid payload")
-			return
-		}
-		s.logger.Error(
-			"create input through HTTP API failed",
-			"method", r.Method,
-			"path", r.URL.Path,
-			"error", err,
-		)
-		s.writeError(w, http.StatusInternalServerError, "failed to create input")
-		return
-	}
-
-	s.writeCreatedInput(w, created)
-}
-
-func (s *Server) writeCreatedInput(w http.ResponseWriter, created db.CreatedInput) {
 	s.writeJSON(w, http.StatusCreated, createInputResponse{
 		InputID:   created.InputID,
 		ProcessID: created.ProcessID,

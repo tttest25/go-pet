@@ -4,7 +4,7 @@
 
 petar — лёгкий оркестратор фоновых задач и обработки знаний с целевым бюджетом
 1 vCPU / 1 GB RAM. Это ориентир развёртывания, не гарантия потребления внешними CLI.
-Документ описывает реализованные Phase 1–2 и backend-контракт действий до T27.
+Документ описывает реализованные Phase 1–2 и backend-контракт действий до T28.
 Команды развёртывания, эксплуатации, восстановления и проверок — в [README](README.md).
 
 - **DB-centric state machine:** PostgreSQL 18 хранит очередь, состояния, аудит и
@@ -93,7 +93,8 @@ PostgreSQL ограничен `mem_limit: 450m`, `max_connections=20`, `io_metho
 │   └── api/                     # net/http ServeMux, публичный результат, logging middleware
 ├── postgres/                    # Вся инфраструктура и SQL БД
 │   ├── data/                    # Bind mount данных, исключён из Git
-│   ├── migrations/              # Пары up/down: 000001–000007
+│   ├── bootstrap.sh             # Initdb: только up, по порядку имён
+│   ├── migrations/              # Пары up/down: 000001–000008
 │   └── postgresql.conf          # PostgreSQL 18, лимиты, io_method
 ├── scripts/
 │   ├── spool-runner.sh          # Хостовый исполнитель
@@ -145,15 +146,14 @@ UUID PK таблиц используют нативную `uuidv7()` PostgreSQL
 
 | Функция | Контракт |
 | --- | --- |
-| `sm_create_input(p_source,p_payload)` | Вызывает `sm_validate_tool_payload`, проверяет наличие активной пары `(payload.tool,1)` в `sm_actions` и только затем создаёт input; возвращает `input_id,process_id,status` |
-| `sm_create_action(p_action,p_version,p_data)` | Принимает только поддерживаемую v1 и объект без ключа `tool`, добавляет доверенный `tool` из `p_action` и вызывает `sm_create_input('api', …)`; не создаёт отдельную цепочку |
+| `sm_create_action(p_action,p_version,p_data)` | Принимает только поддерживаемую v1 и объект без ключа `tool`, добавляет `tool` из `p_action`, проверяет валидатор и активную пару; создаёт input с `source='api'`, возвращает `input_id,process_id,status` |
 | `sm_pick_next_job()` | Атомарно выбирает pending по `priority DESC,created_at ASC`, `FOR UPDATE SKIP LOCKED`, переводит в dispatched; возвращает `id,process_id,tool_name,payload,old_status,status` |
 | `sm_pick_next_job_with_version()` | Вызывает `sm_pick_next_job()` и в том же вызове читает `action_version` захваченной строки; Go использует эту обёртку для spool |
 | `sm_update_job_status(p_job_id,p_status,p_result_path,p_error_msg)` | Принимает только исходные `dispatched/in_progress` и целевые `in_progress/completed/failed`; возвращает VOID; пустые строки путей/ошибок превращает в NULL |
 
 `trg_sm_inputs_after_insert` создаёт **один процесс и одну задачу** из `payload->>'tool'`
 в той же транзакции; ошибка откатывает всю цепочку.
-Валидация payload — контракт `sm_create_input`, а не новое ограничение триггера
+Валидация payload — контракт `sm_create_action`, а не ограничение триггера
 или таблицы. Прямой INSERT сохраняет прежнее поведение. Миграция `000004`
 не меняет ранее созданные задания; её down восстанавливает прежнее тело функции.
 `000005` добавляет проверку доступности только в `sm_create_input`; отключение
@@ -166,6 +166,11 @@ UUID PK таблиц используют нативную `uuidv7()` PostgreSQL
 Её down блокирует `sm_jobs` перед проверкой истории; при наличии любого `word-count`
 отказывается без изменений. Иначе восстанавливает старый CHECK и валидатор
 и удаляет только собственную пару v1. Порядок обновления описан в README.
+`000008` переносит логику создания в `sm_create_action` и удаляет старую
+сигнатуру `sm_create_input(text,jsonb)` без `CASCADE`. Исторические строки и
+их `source`, аудит, каталог, триггеры и spool не переписываются. Down
+воссоздаёт старый SQL-вход и прежнее делегирование; настройки прав удалённой
+функции берутся из согласованного снимка (см. runbook).
 `trg_sm_jobs_notify` вызывает `pg_notify('sm_jobs_channel', NEW.id::text)` при INSERT pending
 или изменении статуса на pending. Уведомление доставляется после COMMIT.
 `trg_sm_jobs_status_audit` срабатывает только при фактическом изменении статуса,
@@ -213,8 +218,8 @@ failed                    --> failed
 ```text
 Время  Отправитель        Действие / получатель
 -----  ----------------  --------------------------------------------------------------
-  01   Клиент       -->  API: POST /api/v1/actions или POST /api/v1/inputs
-  02   API          -->  PostgreSQL: sm_create_action → sm_create_input или legacy sm_create_input
+  01   Клиент       -->  API: POST /api/v1/actions
+  02   API          -->  PostgreSQL: sm_create_action
   03   PostgreSQL   -->  trigger: sm_inputs -> sm_processes -> sm_jobs
   04   PostgreSQL   -->  COMMIT; NOTIFY sm_jobs_channel -> Go worker
   05   API          -->  Клиент: 201 (не ждёт выполнения CLI)
@@ -312,13 +317,12 @@ fabric — два input/процесса, соединённые операто�
 | --- | --- | --- |
 | `GET /healthz` | 200 `{"status":"ok"}` | — |
 | `GET /readyz` | 200 `{"status":"ready"}` после db.Ping | 503 |
-| `POST /api/v1/inputs` | 201, IDs и статус input | 400, 500 |
 | `POST /api/v1/jobs/{id}/status` | 204, без тела | 400, 404, 500 |
 | `GET /api/v1/processes/{id}` | 200, объект процесса | 400, 404, 500 |
 | `GET /api/v1/jobs` | 200, массив задач | 400, 500 |
 | `GET /api/v1/jobs/{id}/result` | 200 публичный JSON, 202 статус | 400, 404, 409, 410, 500, 504 |
 | `GET /api/v1/actions` | 200, массив активных версий | 500, 504 |
-| `POST /api/v1/actions` | 201, тот же объект, что и у legacy-входа | 400, 500, 504 |
+| `POST /api/v1/actions` | 201, IDs и статус input | 400, 500, 504 |
 
 POST принимает один JSON-документ, тело не более 1 MiB; неизвестные поля верхнего
 уровня отклоняются. Ошибки обработчиков имеют `{"error":"..."}`, но это не обещание
@@ -336,21 +340,19 @@ readiness сохраняет JSON 503. Отмена клиентом и обыч
 и для медленного тела JSON-ответ не гарантируется. 504 при мутации не доказывает
 откат и не разрешает автоматический повтор.
 
-Legacy-вход: `{"source":"manual","payload":{"tool":"echo-test","message":"hello"}}`.
-`source` после trim непустой; payload — JSON-объект. Функция БД проверяет точное
-имя `tool` и поля инструмента: `echo-test.message` необязателен (по умолчанию
+Снятый `POST /api/v1/inputs` возвращает стандартный 404. Единственный submit:
+`{"action":"echo-test","version":1,"data":{"message":"hello"}}`.
+Функция БД проверяет точное имя действия и поля инструмента:
+`echo-test.message` необязателен (по умолчанию
 `default echo`); `yt-dlp.url` — абсолютный HTTP(S) URL с host; `fabric.text` —
 непустая строка, необязательный `pattern` — `[A-Za-z0-9_-]{1,128}` (по умолчанию
 `summarize`); `word-count.text` — обязательная JSON-строка, в том числе пустая.
 Явный `null` не заменяет отсутствующее поле. Строки и дополнительные
-поля не переписываются. Неверный payload или отсутствие активной версии 1
-в каталоге даёт SQLSTATE `22023` → HTTP 400
-без вставок; остальные ошибки создания в БД дают HTTP 500.
+поля не переписываются.
 
 Ответ содержит `input_id,process_id,status:"new",id`; легаси `id` равен `input_id`,
 **не job ID**. Job ID получают через GET процесса или списка задач.
 
-Универсальный вход: `{"action":"echo-test","version":1,"data":{"message":"hello"}}`.
 Go проверяет непустое имя без нормализации, JSON-целое `version` в диапазоне
 1…2147483647 и наличие `data`. Отсутствующий `data` даёт 400 до БД; любое
 присутствующее значение, включая `null`, передаётся PostgreSQL без повторного
@@ -358,8 +360,8 @@ Go проверяет непустое имя без нормализации, J
 Четыре поддерживаемые пары v1 используют общий валидатор; `data` должен быть
 объектом без верхнеуровневого `tool`, который добавляет БД. Отключённая
 или неподдерживаемая пара (включая активную v2 без правил) либо неверные
-данные дают `22023` → JSON 400 без input/process/job. Формат 201 общий с
-legacy; существующие GET не включают версию задания.
+данные дают `22023` → JSON 400 без input/process/job. Другие ошибки создания
+дают HTTP 500 (504 по DB-бюджету). Существующие GET не включают версию задания.
 
 Callback использует job UUID и тело:
 
@@ -433,7 +435,7 @@ job ID предыдущей, сохраняя фильтры. Несуществ
 только `action`, `version` (число) и `title`, сортировка `action ASC, version ASC`,
 без пагинации; пустой список — `[]`. Зафиксированные изменения видны без рестарта.
 Отключение версии не скрывает историю задач. Наличие версии в списке не
-гарантирует запуск: нужны реализованные правила; legacy проверяет версию 1.
+гарантирует запуск: нужны реализованные правила.
 Истечение собственного 5-секундного бюджета БД при ошибке даёт JSON 504,
 прочие ошибки БД — JSON 500 без внутренней причины.
 
@@ -460,11 +462,10 @@ Liveness не проверяет БД; readiness проверяет её дос�
   проверки БД, а не предположения, что операция не выполнилась.
 - DB backup не включает spool и серверные роли; согласованный backup и restore
   требуют отдельного сохранения файлов и остановки исполнителей.
-- Compose монтирует одновременно `.up.sql` и `.down.sql` в initdb: entrypoint
-  обрабатывает SQL по имени, а не по смыслу миграции. Проверка свежего bootstrap
-  на чистом PGDATA требует готовую схему, четыре активные пары каталога v1 и
-  успешные откатываемые пробы `sm_create_input` и `sm_create_action('word-count',1,…)`
-  с заданиями v1.
+- Compose initdb применяет только `*.up.sql` по порядку имён, каждый в транзакции.
+  Проверка свежего bootstrap на чистом PGDATA требует готовую схему без legacy
+  SQL-входа, четыре активные пары каталога v1 и успешные откатываемые пробы
+  `sm_create_action` для `echo-test` и `word-count` с заданиями v1.
   Initdb не повторяется при рестарте.
   Bootstrap с проверкой объектов и явным порядком up описан в README;
   `000002` не идемпотентна.
@@ -484,5 +485,6 @@ Liveness не проверяет БД; readiness проверяет её дос�
 [action catalog](postgres/migrations/000005_action_catalog.up.sql),
 [universal input](postgres/migrations/000006_universal_json_input.up.sql),
 [word-count](postgres/migrations/000007_word_count.up.sql),
+[legacy retirement](postgres/migrations/000008_retire_legacy_input.up.sql),
 [writer](internal/spool/writer.go), [worker](internal/spool/worker.go),
 [runner](scripts/spool-runner.sh), [Compose](docker-compose.yml).
