@@ -17,7 +17,7 @@ concurrency:
 jobs:
   test:
     name: Test & Lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
@@ -40,6 +40,12 @@ jobs:
           test -w /tmp/opencode && test -O /tmp/opencode
           sudo apt-get update
           sudo apt-get install -y jq curl util-linux coreutils postgresql-client
+          # The host runner may put a different timeout ahead of GNU coreutils.
+          # Keep the other tool lookups intact and pin only timeout for the gate.
+          [[ "$(/usr/bin/timeout --version)" == 'timeout (GNU coreutils)'* ]]
+          tools=$(mktemp -d "$RUNNER_TEMP/petar-tools.XXXXXXXX")
+          ln -s /usr/bin/timeout "$tools/timeout"
+          printf '%s\n' "$tools" >> "$GITHUB_PATH"
           docker info >/dev/null
 
       - name: Provision isolated PostgreSQL
@@ -49,7 +55,10 @@ jobs:
         working-directory: /opt/go-pet
         env:
           PETAR_TEST_DB_DSN: postgres://petar_user:petar_password@127.0.0.1:5432/petar_test?sslmode=disable
-        run: ./scripts/ci-checks.sh
+        run: |
+          timeout --version
+          [[ "$(timeout --version)" == 'timeout (GNU coreutils)'* ]]
+          ./scripts/ci-checks.sh
 
   fresh-bootstrap:
     name: Verify fresh Compose bootstrap
