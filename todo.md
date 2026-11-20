@@ -164,3 +164,5 @@
 - [ ] **T27: Доказательство расширяемости на word-count.** Backend: каталог → POST → runner → GET по job ID, `{"text":"один два три"}` → `data:{"words":3}` без правок HTTP-обработчиков и wiki. Статус: backend принят; ожидается wiki E2E после PHP-06/07. План: [.opencode/tasks/27_word_count.md](.opencode/tasks/27_word_count.md).
 
 - [x] **T28: Полный переход на универсальный ввод.** После переключения потребителей удалить legacy HTTP/SQL-входы создания задач. На изолированной PG18 доказать сохранность ID, связей, статусов и результатов, продолжение очереди без дублей; старый POST недоступен, новый создаёт одну цепочку. План: [.opencode/tasks/28_retire_legacy_input.md](.opencode/tasks/28_retire_legacy_input.md).
+
+- [ ] **DEPLOY-03: Выпуск Go API и комплекта runner/БД.** Приёмка: без checkout анонимно получены образ по digest и архив `v0.1.0` по SHA-256; SHA тега и образа совпадают, состав и права проверены. Выпуск: [docs/go-release.md](docs/go-release.md).

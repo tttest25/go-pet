@@ -3,8 +3,16 @@ name: CI
 on:
   push:
     branches: [ master, main ]
+    tags: ['v*']
   pull_request:
     branches: [ master, main ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.ref_type == 'tag' && format('go-release-{0}', github.ref) || format('ci-{0}', github.run_id) }}
+  cancel-in-progress: false
 
 jobs:
   test:
@@ -12,7 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -44,7 +55,10 @@ jobs:
     name: Verify fresh Compose bootstrap
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Set canonical checkout path
         run: |
@@ -63,16 +77,168 @@ jobs:
     needs: test
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
 
       - name: Build Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
         with:
           context: .
           push: false
           tags: petar:latest
           load: true
           network: host
+          platforms: linux/amd64
+
+  release-candidate:
+    if: github.event_name == 'push' && github.ref_type == 'tag' && github.repository == 'tttest25/go-pet' && github.event.created && !github.event.deleted && !github.event.forced
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.verify.outputs.sha }}
+      checksum: ${{ steps.verify.outputs.checksum }}
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve release commit and verify bundle
+        id: verify
+        run: |
+          set -euo pipefail
+          sha=$(bash scripts/check-release-ref.sh)
+          git merge-base --is-ancestor "$sha" origin/master
+          archive="$RUNNER_TEMP/go-pet-$GITHUB_REF_NAME.tar.gz"
+          python3 scripts/release-bundle.py pack "$sha" "$archive"
+          python3 scripts/release-bundle.py verify "$sha" "$archive"
+          checksum=$(sha256sum "$archive" | cut -d' ' -f1)
+          printf 'sha=%s\nchecksum=%s\n' "$sha" "$checksum" >> "$GITHUB_OUTPUT"
+
+  release-preflight:
+    needs: [test, fresh-bootstrap, docker, release-candidate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Reject an existing release, including drafts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases" |
+            jq -e 'type == "array" and all(.[]; type == "array") and
+              all(.[][]; .tag_name != env.GITHUB_REF_NAME)' >/dev/null
+
+  publish-image:
+    needs: [release-candidate, release-preflight]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.image.outputs.digest }}
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          ref: ${{ needs.release-candidate.outputs.sha }}
+          persist-credentials: false
+      - name: Refuse to replace an existing GHCR version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          bash scripts/check-release-ref.sh >/dev/null
+          # Use the same registry identity as the push, not an anonymous probe
+          # (a private matching package would otherwise look absent).
+          token=$(printf 'user = "%s:%s"\n' "$GITHUB_ACTOR" "$GH_TOKEN" |
+            curl -q --config - -fsS --get 'https://ghcr.io/token' \
+              --data-urlencode 'service=ghcr.io' \
+              --data-urlencode 'scope=repository:tttest25/go-pet:pull,push' |
+            jq -er '.token | select(type == "string" and length > 0)')
+          printf '::add-mask::%s\n' "$token"
+          response="$RUNNER_TEMP/go-package-check.json"
+          status=$(printf 'header = "Authorization: Bearer %s"\n' "$token" |
+            curl -q --config - -sS -o "$response" -w '%{http_code}' \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+              "https://ghcr.io/v2/tttest25/go-pet/manifests/$GITHUB_REF_NAME")
+          if [[ $status != 404 ]] ||
+             ! jq -e 'any(.errors[]; .code == "MANIFEST_UNKNOWN" or .code == "NAME_UNKNOWN")' "$response" >/dev/null; then
+            echo "Refusing to push: cannot prove that GHCR version is absent (HTTP $status)" >&2
+            exit 1
+          fi
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Push tested revision to GHCR
+        id: image
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/tttest25/go-pet:${{ github.ref_name }}
+          network: host
+          platforms: linux/amd64
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.release-candidate.outputs.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+
+  publish-release:
+    needs: [release-candidate, publish-image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          ref: ${{ needs.release-candidate.outputs.sha }}
+          persist-credentials: false
+      - name: Verify digest and publish checked assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ needs.publish-image.outputs.digest }}
+          TESTED_SUM: ${{ needs.release-candidate.outputs.checksum }}
+        run: |
+          set -euo pipefail
+          sha=$(bash scripts/check-release-ref.sh)
+          [[ $DIGEST =~ ^sha256:[a-f0-9]{64}$ && $TESTED_SUM =~ ^[a-f0-9]{64}$ ]]
+          out=$(mktemp -d "$RUNNER_TEMP/go-release.XXXXXXXX")
+          archive="go-pet-$GITHUB_REF_NAME.tar.gz"
+          python3 scripts/release-bundle.py pack "$sha" "$out/$archive"
+          python3 scripts/release-bundle.py verify "$sha" "$out/$archive"
+          cd -- "$out"
+          printf '%s  %s\n' "$TESTED_SUM" "$archive" > SHA256SUMS
+          sha256sum --check SHA256SUMS
+          image="ghcr.io/tttest25/go-pet@$DIGEST"
+          jq -n --arg version "$GITHUB_REF_NAME" --arg git_sha "$sha" --arg image "$image" \
+            --arg archive "$archive" --arg archive_sha256 "$TESTED_SUM" \
+            '{$version, $git_sha, $image, $archive, $archive_sha256}' > release.json
+
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases" |
+            jq -e 'all(.[][]; .tag_name != env.GITHUB_REF_NAME)' >/dev/null
+          gh release create "$GITHUB_REF_NAME" "$archive" SHA256SUMS release.json \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --draft --target "$sha" \
+            --title "Go Pet $GITHUB_REF_NAME" --notes "Git commit: \`$sha\` · image: \`$image\`"
+          release_id=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases" |
+            jq -er '[.[][] | select(.tag_name == env.GITHUB_REF_NAME and .draft)] |
+              if length == 1 then .[0].id else error("expected one draft release") end')
+          assets=$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets")
+          jq -e 'length == 3' <<<"$assets" >/dev/null
+          for file in "$archive" SHA256SUMS release.json; do
+            asset_id=$(jq -er --arg name "$file" '[.[] | select(.name == $name and .state == "uploaded")] |
+              if length == 1 then .[0].id else error("missing uploaded asset") end' <<<"$assets")
+            gh api -H 'Accept: application/octet-stream' \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$file.download"
+            cmp "$file" "$file.download"
+          done
+          (cd -- "$GITHUB_WORKSPACE" && bash scripts/check-release-ref.sh >/dev/null)
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" -F draft=false |
+            jq -e '.tag_name == env.GITHUB_REF_NAME and .draft == false and .immutable == true' >/dev/null
